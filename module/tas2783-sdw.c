@@ -25,6 +25,7 @@
 #include <linux/pm_runtime.h>
 #include <linux/regmap.h>
 #include <linux/wait.h>
+#include <linux/completion.h>
 #include <linux/soundwire/sdw.h>
 #include <linux/soundwire/sdw_registers.h>
 #include <linux/soundwire/sdw_type.h>
@@ -1116,13 +1117,36 @@ static s32 tas2783_sdca_dev_resume(struct device *dev)
 {
 	struct sdw_slave *slave = dev_to_sdw_dev(dev);
 	struct tas2783_prv *tas_dev = dev_get_drvdata(dev);
-	int ret;
 
-	ret = sdw_slave_wait_for_init(slave, TAS2783_PROBE_TIMEOUT);
+#ifdef HAVE_SDW_SLAVE_WAIT_FOR_INIT
+	int ret = sdw_slave_wait_for_init(slave, TAS2783_PROBE_TIMEOUT);
+
 	if (ret) {
 		sdw_show_ping_status(slave->bus, true);
 		return ret;
 	}
+#else
+	/*
+	 * sdw_slave_wait_for_init() is neither declared nor exported on some
+	 * kernels (Arch 7.1.9-arch1-2). Open-code what the in-tree SDCA codec
+	 * drivers do in its place. The unattach_request test is not optional:
+	 * without it a resume where the peripheral never left the bus waits
+	 * out the full TAS2783_PROBE_TIMEOUT on every single resume, because
+	 * initialization_complete is only re-armed on re-enumeration.
+	 */
+	if (slave->unattach_request) {
+		unsigned long time;
+
+		time = wait_for_completion_timeout(&slave->initialization_complete,
+						   msecs_to_jiffies(TAS2783_PROBE_TIMEOUT));
+		if (!time) {
+			dev_err(dev, "%s: init not complete\n", __func__);
+			sdw_show_ping_status(slave->bus, true);
+			return -ETIMEDOUT;
+		}
+	}
+	slave->unattach_request = 0;
+#endif
 
 	regcache_cache_only(tas_dev->regmap, false);
 	regcache_sync(tas_dev->regmap);
@@ -1357,10 +1381,18 @@ static s32 tas_sdw_probe(struct sdw_slave *peripheral,
 
 		/* Parse the function */
 		/*
-		 * sdca_parse_function() dropped its struct sdw_slave argument in
-		 * 7.3 (it reaches the peripheral through function_data->desc).
+		 * sdca_parse_function() has three signatures in the wild, so the
+		 * shape is probed from the target kernel's header at build time
+		 * (see the Makefile) rather than guessed from a version number:
+		 *
+		 *   (dev, sdw, desc, function)  - e.g. Arch 7.1.9-arch1-2
+		 *   (dev, sdw, function)        - the form this driver was written against
+		 *   (dev, function)             - 7.3, peripheral reached via function->desc
 		 */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 3, 0)
+#if defined(HAVE_SDCA_PARSE_FUNCTION_DESC)
+		ret = sdca_parse_function(dev, peripheral, function_data->desc,
+					  function_data);
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(7, 3, 0)
 		ret = sdca_parse_function(dev, function_data);
 #else
 		ret = sdca_parse_function(dev, peripheral, function_data);
