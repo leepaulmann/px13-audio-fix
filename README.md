@@ -31,6 +31,21 @@ with (clang on CachyOS, gcc on Arch stock and Fedora), so no manual `LLVM=1`.
 
 ---
 
+> **This is a fork** of [ftoleedo/px13-audio-fix](https://github.com/ftoleedo/px13-audio-fix)
+> — all the original work and the hard diagnosis is theirs. It adds, on top of
+> upstream:
+>
+> - a **stock-Arch 7.1.9 port** of the DKMS module: `sdca_parse_function()` and
+>   `sdw_slave_wait_for_init()` are probed from the target kernel's headers at
+>   build time, because trees sharing a `LINUX_VERSION_CODE` do not share those
+>   signatures;
+> - a fix for a **hard freeze on resume** the recovery script itself could
+>   cause (see [§5](#5-the-recovery-itself-could-freeze-the-machine-fixed-2026-09-05));
+> - `install-oops-panic.sh`, optional hardening so a kernel oops reboots
+>   instead of hanging.
+>
+> Pull upstream's fixes with `git pull upstream main`.
+
 ## TL;DR — what is broken on stock ≥ 7.1 and how this repo fixes it
 
 TI upstreamed a new tas2783 driver in Linux 7.1 (it is **not** nealstar's
@@ -56,7 +71,7 @@ blobs from the Windows driver**.
 ## Quick install
 
 ```bash
-git clone https://github.com/ftoleedo/px13-audio-fix.git && cd px13-audio-fix
+git clone https://github.com/leepaulmann/px13-audio-fix.git && cd px13-audio-fix
 bash install-durable.sh        # asks for sudo when needed
 bash install-resume-recovery.sh   # survive suspend/resume
 bash install-oops-panic.sh        # optional: reboot on oops instead of freeze
