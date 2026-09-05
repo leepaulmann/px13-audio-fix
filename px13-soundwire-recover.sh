@@ -42,8 +42,27 @@ fi
 # shellcheck source=lib/px13-detect.sh
 . "$DETECT"
 
-# give the resume time to finish and the session to thaw before touching anything
-sleep 2
+# Give the resume time to finish and the session to thaw before touching
+# anything. This is NOT just cosmetic politeness: at sleep 2 the unbind below
+# lands ~2 s after "PM: suspend exit", while the ACP is still settling, and it
+# raced the driver's own teardown into a corrupted resource tree:
+#
+#   BUG: kernel NULL pointer dereference, address: 0000000000000050
+#   RIP: release_resource+0x34/0x80
+#     platform_device_del <- platform_device_unregister <- pci_device_remove
+#     <- device_release_driver_internal <- unbind_store   (7.1.9, 2026-09-05)
+#
+# release_resource() holds the global resource_lock for write, so the oops left
+# it locked forever: every later GPU page fault (amdgpu_gem_fault -> ttm ->
+# pfnmap_setup_cachemode -> walk_system_ram_range) spun on it and the whole
+# desktop froze hard (soft lockups in quickshell and brave; only a power cycle
+# cleared it). Roughly 1 resume in 10.
+#
+# On healthy resumes SoundWire re-enumeration does not even report in until
+# ~t+7 s, so 10 s puts the teardown well clear of the resume path. Dropping the
+# sysfs unbind would NOT help - modprobe -r snd_pci_ps runs the same
+# pci_device_remove path. The lever is when, not how.
+sleep "${PX13_RESUME_SETTLE:-10}"
 
 PCI="$(px13_acp_pci)" || PCI=""
 if [ -z "$PCI" ]; then
@@ -69,19 +88,32 @@ ru() { runuser -u "$UNAME" -- env XDG_RUNTIME_DIR="$RT" DBUS_SESSION_BUS_ADDRESS
 # restarting PipeWire afterwards; do not rely on that.
 release_card() {
   if [ -S "$RT/bus" ]; then
-    ru systemctl --user stop wireplumber pipewire pipewire-pulse
-    log "recover: pipewire parado antes do reload (libera o card)"
-    sleep 2
+    # The .socket units have to go too. Stopping only the services leaves
+    # socket activation armed: systemd respawns PipeWire on the next access, it
+    # re-opens /dev/snd, and the check below then aborts the reload EVERY time.
+    # systemd says so itself in the journal:
+    #   Stopping 'pipewire.service', but its triggering units are still active:
+    #   pipewire.socket
+    # Waiting longer does not help - the socket has to be down.
+    ru systemctl --user stop wireplumber pipewire pipewire-pulse \
+                              pipewire.socket pipewire-pulse.socket
+    log "recover: pipewire+sockets parados antes do reload (libera o card)"
   fi
-  # fuser prints the PIDs on stdout and the file name on stderr
-  local pids names
-  pids="$(fuser /dev/snd/* 2>/dev/null | tr -s ' ' | sed 's/^ *//;s/ *$//')"
-  if [ -n "$pids" ]; then
-    names="$(ps -o comm= -p $pids 2>/dev/null | sort -u | tr '\n' ' ')"
-    log "AVISO: /dev/snd ainda aberto por [$pids] $names - o rmmod travaria"
-    return 1
-  fi
-  return 0
+  # fuser prints the PIDs on stdout and the file name on stderr.
+  # Poll rather than sleep a fixed amount: with the sockets down the release is
+  # usually immediate, but it is not instantaneous.
+  local i pids names
+  for i in $(seq 1 "${PX13_RELEASE_WAIT:-15}"); do
+    pids="$(fuser /dev/snd/* 2>/dev/null | tr -s ' ' | sed 's/^ *//;s/ *$//')"
+    if [ -z "$pids" ]; then
+      log "recover: /dev/snd liberado apos ${i}s"
+      return 0
+    fi
+    sleep 1
+  done
+  names="$(ps -o comm= -p $pids 2>/dev/null | sort -u | tr '\n' ' ')"
+  log "AVISO: /dev/snd ainda aberto por [$pids] $names - o rmmod travaria"
+  return 1
 }
 
 # There is no "already Attached, skip" shortcut: s2idle wipes the TAS2783 DSP
@@ -94,7 +126,8 @@ is_bound && px13_sdw_all_attached &&
 # --- full module reload (order mapped with lsmod, kernel 7.1.5) -------------
 if ! release_card; then
   log "recover: ABORTANDO o reload - o card segue em uso e o rmmod travaria o kernel"
-  [ -S "$RT/bus" ] && ru systemctl --user start wireplumber pipewire pipewire-pulse
+  [ -S "$RT/bus" ] && ru systemctl --user start pipewire.socket pipewire-pulse.socket \
+                                                  wireplumber pipewire pipewire-pulse
   exit 1
 fi
 [ -e "/sys/bus/pci/devices/$PCI/driver" ] && { echo "$PCI" > "$DRV/unbind" 2>>"$LOG"; sleep 1; }
@@ -130,6 +163,7 @@ px13_sdw_all_attached || log "recover: codecs seguem fora - audio interno indisp
 # ALWAYS restart the session's PipeWire: a vanished SoundWire card leaves the
 # WirePlumber graph wedged and takes Bluetooth audio down with it
 if [ -S "$RT/bus" ]; then
+  ru systemctl --user start pipewire.socket pipewire-pulse.socket
   ru systemctl --user restart wireplumber pipewire pipewire-pulse
   sleep 4
   if px13_sdw_all_attached; then

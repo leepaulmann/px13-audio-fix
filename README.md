@@ -58,6 +58,8 @@ blobs from the Windows driver**.
 ```bash
 git clone https://github.com/ftoleedo/px13-audio-fix.git && cd px13-audio-fix
 bash install-durable.sh        # asks for sudo when needed
+bash install-resume-recovery.sh   # survive suspend/resume
+bash install-oops-panic.sh        # optional: reboot on oops instead of freeze
 # reboot once if the module can't be live-reloaded
 ```
 
@@ -222,6 +224,59 @@ with a healthy bus, so you find out it works without having to suspend).
 
 Everything is logged to `/var/log/px13-soundwire-resume.log`.
 
+### 5. The recovery itself could freeze the machine (fixed 2026-09-05)
+
+Tearing the ACP down 2 s after `PM: suspend exit` — the old `sleep 2` in
+`px13-soundwire-recover.sh` — races the driver's own teardown. On `7.1.9-arch1-2`
+it landed in a corrupted resource tree:
+
+```
+BUG: kernel NULL pointer dereference, address: 0000000000000050
+RIP: release_resource+0x34/0x80
+  platform_device_del <- platform_device_unregister <- pci_device_remove
+  <- device_release_driver_internal <- unbind_store
+```
+
+`release_resource()` holds the global `resource_lock` for **write**. The oops
+killed the task with the lock still held (`exited with irqs disabled /
+preempt_count 1`), so every subsequent GPU page fault —
+
+```
+amdgpu_gem_fault -> ttm_bo_vm_fault_reserved -> vmf_insert_pfn_prot
+  -> pfnmap_setup_cachemode -> lookup_memtype -> pat_pagerange_is_ram
+  -> walk_system_ram_range -> find_next_res -> queued_read_lock_slowpath
+```
+
+— spun on it forever. The desktop froze solid: keystrokes still registered,
+then the first redraw wedged the compositor (`soft lockup - CPU#12 stuck for
+26s! [quickshell:gl0]`). Only a power cycle cleared it. Roughly 1 resume in 10.
+
+**The fix is the delay, not the method.** Dropping the sysfs unbind would not
+help — `modprobe -r snd_pci_ps` runs the same `pci_device_remove` path. The
+lever is *when* the teardown starts. On healthy resumes SoundWire
+re-enumeration does not report in until ~t+7 s, so the settle is now:
+
+```bash
+sleep "${PX13_RESUME_SETTLE:-10}"
+```
+
+Raise `PX13_RESUME_SETTLE` if it ever recurs, rather than reaching for a
+different teardown method.
+
+Pair it with `bash install-oops-panic.sh` (optional): a kernel oops then
+reboots after 10 s instead of hanging, which is both kinder to use and what
+makes the bug practical to chase — each hit becomes a logged oops rather than
+a wedge.
+
+**Upstream status: unreported.** The crashing frames are all in-tree core code,
+so it is a legitimate `snd_pci_ps` teardown bug — but the kernel is tainted
+`G OE` by the DKMS module in `module/`, which is a modified copy of a driver in
+the very stack being torn down. The trace shows where the corruption was
+*detected*, not where it was *created*, so the honest first step is a repro with
+the stock in-tree `snd-soc-tas2783-sdw` (DKMS keeps it under
+`/var/lib/dkms/snd-soc-tas2783-sdw-px13/original_module/`). Reproduces
+untainted → worth filing. Does not → the bug is in this repo's patch.
+
 ---
 
 ## What gets installed where
@@ -237,6 +292,7 @@ Everything is logged to `/var/log/px13-soundwire-resume.log`.
 | `50-px13-soundwire` | `/usr/lib/systemd/system-sleep/` | Recovers SoundWire after s2idle |
 | `configs/99-echo-cancel.conf` | `~/.config/pipewire/pipewire.conf.d/` | Optional: echo-cancelled mic source for calls |
 | `configs/51-amd-sdw-channels.conf` | `~/.config/wireplumber/wireplumber.conf.d/` | Optional: FL/FR channel positions on the speaker node |
+| `configs/oops-panic.conf` | `/etc/limine-entry-tool.d/` (limine only) | Optional: `panic_on_oops=1 panic=10` so a kernel oops reboots instead of freezing — install with `bash install-oops-panic.sh`, which falls back to printing GRUB/systemd-boot instructions on other bootloaders |
 
 ### The kernel-side patch (module/)
 
