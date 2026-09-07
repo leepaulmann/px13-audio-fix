@@ -38,6 +38,26 @@ if command -v dkms >/dev/null 2>&1; then
            Usually the driver API moved upstream; see /var/lib/dkms/snd-soc-tas2783-sdw-px13/1.0/build/make.log"
 fi
 
+# 1b. the sdw_utils module with the RESUME re-prepare fix ---------------------
+KMM="$(uname -r | cut -d. -f1-2)"
+SDWU="$(modinfo -k "$(uname -r)" snd_soc_sdw_utils -F filename 2>/dev/null)"
+if [ "$(printf '%s\n7.3\n' "$KMM" | sort -V | head -1)" = 7.3 ]; then
+  ok "kernel $KMM carries the sdw_utils RESUME fix in-tree (DKMS copy not needed)"
+else
+  case "$SDWU" in
+    */updates/*) ok "sdw_utils RESUME fix installed ($SDWU)" ;;
+    *) warn "sdw_utils RESUME fix NOT active for $(uname -r): a PCM open across suspend comes back silent.
+           New kernel series? cd module-sdw-utils && ./fetch-sources.sh && bash ../install-durable.sh" ;;
+  esac
+fi
+for m in snd_soc_tas2783_sdw snd_soc_sdw_utils; do
+  MEM="$(cat /sys/module/$m/srcversion 2>/dev/null)"
+  DISK="$(modinfo -k "$(uname -r)" $m -F srcversion 2>/dev/null)"
+  if [ -n "$MEM" ] && [ -n "$DISK" ] && [ "$MEM" != "$DISK" ]; then
+    warn "$m: newer build on disk than in memory - reboot or: sudo PX13_RECOVER_POLICY=always bash test-sdw-module-reload.sh"
+  fi
+done
+
 # 2. the per-amp channel control ---------------------------------------------
 AMPS="$(px13_amp_count "$CARD")"
 CH="$(amixer -D "hw:$CARD" controls 2>/dev/null | grep -c 'Channel Playback')"
@@ -93,4 +113,26 @@ fi
 echo
 [ "$RC" = 0 ] && echo "All good. Play something: speaker-test -D pulse -c2 -l1 -t wav" \
               || echo "Something is off - see the arrows above."
+
+# 6. resume health: driver state, recovery policy, oops hardening ------------
+FWS="$(px13_tas2783_fw_states)"; FWRC=$?
+case "$FWRC" in
+  0) ok "amp firmware state ($FWS)" ;;
+  2) warn "no fw_state attribute - codec module older than 1.1 (bash install-durable.sh)" ;;
+  *) bad "amp firmware state" "$FWS - an amp is attached but not initialised.
+           Fallback: sudo PX13_RECOVER_POLICY=always /usr/local/lib/px13-soundwire-recover.sh" ;;
+esac
+POLICY="$(px13_cache_get PX13_RECOVER_POLICY 2>/dev/null || true)"
+case "${POLICY:-auto}" in
+  auto)   ok "resume recovery policy: auto (reload only when the driver failed)" ;;
+  always) warn "resume recovery policy: always (full reload + PipeWire restart on every resume; Brave loses its mic)" ;;
+  never)  warn "resume recovery policy: never (no fallback if the driver fails to recover)" ;;
+  *)      warn "resume recovery policy '$POLICY' unknown - treated as auto" ;;
+esac
+if [ "$(cat /proc/sys/kernel/panic_on_oops 2>/dev/null)" = 1 ]; then
+  ok "kernel.panic_on_oops=1 (an oops reboots instead of freezing)"
+else
+  warn "kernel.panic_on_oops=0 - an oops in the audio teardown freezes the machine; bash install-oops-panic.sh"
+fi
+
 exit "$RC"

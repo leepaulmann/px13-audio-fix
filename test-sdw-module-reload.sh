@@ -21,7 +21,7 @@ export PX13_DETECT_LIB="$REPO/lib/px13-detect.sh"
 echo "=== before: $(px13_sdw_status_str)"
 echo "=== ACP PCI: $(px13_acp_pci || echo '(not found)')"
 echo "=== running the recovery (~30 s, audio drops out)..."
-bash "$REPO/px13-soundwire-recover.sh"
+PX13_RECOVER_POLICY=always bash "$REPO/px13-soundwire-recover.sh"
 echo "=== after : $(px13_sdw_status_str)"
 echo "=== log ---"
 tail -n 8 /var/log/px13-soundwire-resume.log 2>/dev/null | sed 's/^/    /'

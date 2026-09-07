@@ -1,16 +1,27 @@
 #!/bin/bash
-# PX13 - SoundWire audio recovery after s2idle resume.
+# PX13 - SoundWire audio recovery after s2idle resume (FALLBACK).
 # Runs as a transient unit (systemd-run) fired by the sleep hook
 # /usr/lib/systemd/system-sleep/50-px13-soundwire - NEVER inline in the resume
 # path, or the user session stays frozen (black screen) until it finishes.
 #
-# Method (validated 2026-07-30): FULL RELOAD of the SoundWire/ACP module stack.
-# A shallow PCI unbind/bind does not work on kernel 7.1.5 - the slaves drop off
-# the bus after s2idle and only a from-scratch re-enumeration brings them back.
+# Since module 1.1 the amps recover on their own: the codec driver carries the
+# 7.3 resume fixes (stale regcache dropped on re-attach, PDE powered before
+# port prepare, firmware replayed from memory, bounded retry) and sdw_utils
+# re-prepares the SoundWire stream on SNDRV_PCM_TRIGGER_RESUME. The card never
+# actually disappears across s2idle - the slaves come back Attached by
+# themselves - so on a healthy resume this script must NOT touch anything:
+# every PipeWire restart disconnects Chromium's audio service (no mic in Brave
+# until it is restarted) and the PCI teardown below has oopsed the kernel.
 #
-#   - reload ALWAYS (even when Attached): the TAS2783 DSP firmware does not
-#     survive s2idle and only a re-probe re-downloads it ("playback without fw
-#     download" = silently muted amp);
+# PX13_RECOVER_POLICY (env, else /etc/px13-audio-fix.conf, default auto):
+#   auto   - health check (slaves Attached, fw_state ok, no resume errors in the
+#            kernel log); reload only when it fails
+#   always - unconditional reload (the pre-1.1 behaviour)
+#   never  - log and exit (driver testing)
+#
+# The fallback itself: FULL RELOAD of the SoundWire/ACP module stack (validated
+# 2026-07-30; a shallow PCI unbind/bind did not re-enumerate on 7.1.5).
+#
 #   - STOP the session's PipeWire FIRST, then unbind PCI -> rmmod stack
 #     (children first) -> modprobe -> bind. Unloading the codec while userspace
 #     still holds the ALSA card blocks forever in snd_card_disconnect_sync():
@@ -18,11 +29,12 @@
 #     7.2.2, 2026-09-01). 7.1 tolerated restarting PipeWire afterwards; 7.2
 #     does not;
 #   - wait for Attached (up to 20 s);
-#   - ALWAYS restart the session's PipeWire (a vanished card wedges the
-#     WirePlumber graph and kills even Bluetooth audio - seen 2026-07-29);
+#   - restart the session's PipeWire (it was stopped above; a vanished card
+#     wedges the WirePlumber graph and kills even Bluetooth audio - 2026-07-29);
 #   - on success: reapply the HiFi profile and unmute the speaker (only becomes
 #     the default sink if the current default is auto_null, so it never steals
-#     from a Bluetooth headset).
+#     from a Bluetooth headset);
+#   - restart Chromium/Electron audio services so browsers see the mic again.
 #
 # Nothing here is hardcoded to one PX13 SKU: the PCI address, the PipeWire card
 # and the speaker sink are all probed (see lib/px13-detect.sh).
@@ -116,12 +128,31 @@ release_card() {
   return 1
 }
 
-# There is no "already Attached, skip" shortcut: s2idle wipes the TAS2783 DSP
-# firmware even with the bus Attached ("error playback without fw download" in
-# dmesg - the amp goes silent while every mixer level looks fine; seen
-# 2026-07-30). Only a re-probe re-downloads it. ALWAYS reload.
-is_bound && px13_sdw_all_attached &&
-  log "recover: codecs Attached, mas recarregando mesmo assim (fw do amp nao sobrevive ao s2idle)"
+# --- policy / health check ---------------------------------------------------
+# Before module 1.1 this reloaded unconditionally ("the amp firmware does not
+# survive s2idle"). It does now: the driver re-downloads it on re-attach and
+# reports the outcome in sysfs (fw_state), so the reload is only for the cases
+# the driver could not handle (e.g. rt721 "failed to resume: -110" after very
+# long sleeps).
+POLICY="${PX13_RECOVER_POLICY:-$(px13_cache_get PX13_RECOVER_POLICY 2>/dev/null || true)}"
+case "${POLICY:-auto}" in auto|always|never) ;; *) log "recover: unknown policy '$POLICY' - using auto"; POLICY=auto ;; esac
+POLICY="${POLICY:-auto}"
+case "$POLICY" in
+  never)
+    log "recover: policy=never - leaving the stack alone (slaves:$(px13_sdw_status_str))"
+    exit 0 ;;
+  auto)
+    FW="$(px13_tas2783_fw_states)"; FWRC=$?
+    ERRS="$(px13_resume_errors)"
+    if is_bound && px13_sdw_all_attached && [ "$FWRC" != 1 ] && [ -z "$ERRS" ]; then
+      log "recover: healthy, nothing to do (fw:${FW:-no attribute} slaves:$(px13_sdw_status_str))"
+      exit 0
+    fi
+    log "recover: NOT healthy -> full reload (bound=$(is_bound && echo y || echo n) fw:${FW:-?} slaves:$(px13_sdw_status_str) errors=$(printf '%s' "$ERRS" | grep -c .))"
+    [ -n "$ERRS" ] && printf '%s\n' "$ERRS" | sed 's/^/    /' >> "$LOG" ;;
+  always)
+    log "recover: policy=always - unconditional reload (slaves:$(px13_sdw_status_str))" ;;
+esac
 
 # --- full module reload (order mapped with lsmod, kernel 7.1.5) -------------
 if ! release_card; then
@@ -160,11 +191,13 @@ for i in $(seq 1 40); do sleep 0.5; px13_sdw_all_attached && break; done
 log "recover pos-reload:$(px13_sdw_status_str)"
 px13_sdw_all_attached || log "recover: codecs seguem fora - audio interno indisponivel (reboot); BT/HDMI liberados pelo restart abaixo"
 
-# ALWAYS restart the session's PipeWire: a vanished SoundWire card leaves the
-# WirePlumber graph wedged and takes Bluetooth audio down with it
+# Restart the session's PipeWire (stopped in release_card): a vanished
+# SoundWire card leaves the WirePlumber graph wedged and takes Bluetooth audio
+# down with it. One 'start' for everything - 'start sockets' followed by
+# 'restart services' bounced PipeWire twice and confused the portal/bar.
 if [ -S "$RT/bus" ]; then
-  ru systemctl --user start pipewire.socket pipewire-pulse.socket
-  ru systemctl --user restart wireplumber pipewire pipewire-pulse
+  ru systemctl --user start pipewire.socket pipewire-pulse.socket \
+                            wireplumber pipewire pipewire-pulse
   sleep 4
   if px13_sdw_all_attached; then
     CARD="$(px13_pw_card_as ru)"
@@ -182,6 +215,10 @@ if [ -S "$RT/bus" ]; then
   else
     log "recover: pipewire reiniciado sem speaker interno"
   fi
+  # Chromium keeps a dead PulseAudio socket after the restart and lists zero
+  # audio devices ("no microphone" in Meet). Its audio service respawns.
+  PIDS="$(px13_restart_browser_audio_services "$UNAME")"
+  [ -n "${PIDS:-}" ] && log "recover: browser audio service(s) restarted (pids: $PIDS) so the mic is listed again"
 else
   log "AVISO: $RT/bus ausente - pipewire nao reiniciado"
 fi
