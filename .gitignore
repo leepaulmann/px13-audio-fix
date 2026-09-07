@@ -19,3 +19,15 @@ DRAFT-github-comment-737.md
 
 # vendor Windows driver blob (kept locally, never committed)
 *.exe
+
+# sdw_utils DKMS package: sources are fetched per kernel, dkms.conf generated
+module-sdw-utils/src/
+module-sdw-utils/dkms.conf
+module-sdw-utils/*.ko
+module-sdw-utils/*.o
+module-sdw-utils/*.mod
+module-sdw-utils/*.mod.c
+module-sdw-utils/.*.cmd
+module-sdw-utils/modules.order
+module-sdw-utils/Module.symvers
+module-sdw-utils/.module-common.o

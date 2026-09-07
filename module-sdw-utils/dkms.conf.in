@@ -1,0 +1,10 @@
+PACKAGE_NAME="snd-soc-sdw-utils-px13"
+PACKAGE_VERSION="@VERSION@"
+BUILT_MODULE_NAME[0]="snd-soc-sdw-utils"
+DEST_MODULE_LOCATION[0]="/updates"
+MAKE[0]="make KVER=${kernelver}"
+CLEAN="make KVER=${kernelver} clean"
+AUTOINSTALL="yes"
+# Sources are the stable tag of ONE kernel series; never build them against
+# another one (fetch-sources.sh regenerates this file for a new series).
+BUILD_EXCLUSIVE_KERNEL="^@SERIES@\."
