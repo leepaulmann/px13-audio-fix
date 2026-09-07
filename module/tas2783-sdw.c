@@ -42,7 +42,14 @@
 
 #include "tas2783.h"
 
-#define TIMEOUT_FW_DL_MS (3000)
+/*
+ * PX13: 10 s instead of 3 s. Only the first (boot-time) download goes through
+ * the firmware loader; after that the image is re-sent from memory. On the
+ * boot path a UEVENT request can legitimately wait for userspace.
+ */
+#define TIMEOUT_FW_DL_MS (10000)
+/* PX13: how often a failed re-initialisation is retried before giving up */
+#define TAS2783_INIT_RETRIES 5
 #define FW_DL_OFFSET	84 /* binary file information */
 #define FW_FL_HDR	20 /* minimum number of bytes in one chunk */
 #define TAS2783_PROBE_TIMEOUT 5000
@@ -105,6 +112,27 @@ struct tas2783_prv {
 	bool fw_dl_success;
 	/* use fallback fw name */
 	bool fw_use_fallback;
+
+	/*
+	 * PX13: local hardening, not upstream.
+	 *  - fw_img: copy of the firmware image loaded at boot, so that a
+	 *    re-initialisation after s2idle never touches the firmware loader.
+	 *  - init_lock/init_work: tas_io_init() can run from the SoundWire
+	 *    status thread and from the retry work; serialise them and retry a
+	 *    bounded number of times instead of leaving the amp silent.
+	 *  - user_*: the last values userspace wrote through the mixer, re-applied
+	 *    after every re-initialisation (the SW reset + init sequence would
+	 *    otherwise leave both amps on cluster index 0x01 = mono/left and the
+	 *    digital volume at 0 dB, and userspace is not told).
+	 */
+	u8 *fw_img;
+	size_t fw_img_sz;
+	struct mutex init_lock;
+	struct delayed_work init_work;
+	unsigned int init_retries;
+	bool init_failed;
+	bool user_ch_set, user_amp_set, user_dvc_set;
+	unsigned int user_ch, user_amp_lvl, user_dvc_lvl;
 };
 
 static const struct reg_default tas2783_reg_default[] = {
@@ -593,10 +621,36 @@ static s32 tas2783_digital_getvol(struct snd_kcontrol *kcontrol,
 	return snd_soc_get_volsw(kcontrol, ucontrol);
 }
 
+/*
+ * PX13: remember the register value userspace just set so that
+ * tas_restore_user_state() can re-apply it after a re-initialisation.
+ * Component controls are registered with the component as their chip
+ * pointer (snd_soc_add_component_controls), hence snd_kcontrol_chip().
+ */
+static void tas2783_remember_reg(struct snd_kcontrol *kcontrol, unsigned int reg,
+				 unsigned int *val, bool *set)
+{
+	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
+	struct tas2783_prv *tas_dev = snd_soc_component_get_drvdata(component);
+	unsigned int v;
+
+	if (regmap_read(tas_dev->regmap, reg, &v))
+		return;
+	*val = v;
+	*set = true;
+}
+
 static s32 tas2783_digital_putvol(struct snd_kcontrol *kcontrol,
 				  struct snd_ctl_elem_value *ucontrol)
 {
-	return snd_soc_put_volsw(kcontrol, ucontrol);
+	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
+	struct tas2783_prv *tas_dev = snd_soc_component_get_drvdata(component);
+	s32 ret = snd_soc_put_volsw(kcontrol, ucontrol);
+
+	if (ret >= 0)
+		tas2783_remember_reg(kcontrol, TAS2783_DVC_LVL,
+				     &tas_dev->user_dvc_lvl, &tas_dev->user_dvc_set);
+	return ret;
 }
 
 static s32 tas2783_amp_getvol(struct snd_kcontrol *kcontrol,
@@ -608,7 +662,14 @@ static s32 tas2783_amp_getvol(struct snd_kcontrol *kcontrol,
 static s32 tas2783_amp_putvol(struct snd_kcontrol *kcontrol,
 			      struct snd_ctl_elem_value *ucontrol)
 {
-	return snd_soc_put_volsw(kcontrol, ucontrol);
+	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
+	struct tas2783_prv *tas_dev = snd_soc_component_get_drvdata(component);
+	s32 ret = snd_soc_put_volsw(kcontrol, ucontrol);
+
+	if (ret >= 0)
+		tas2783_remember_reg(kcontrol, TAS2783_AMP_LEVEL,
+				     &tas_dev->user_amp_lvl, &tas_dev->user_amp_set);
+	return ret;
 }
 
 /*
@@ -635,6 +696,30 @@ static SOC_VALUE_ENUM_SINGLE_DECL(tas2783_ch_enum,
 		     SDCA_CTL_UDMPU_CLUSTERINDEX, 0),
 	0, 0x7, tas2783_ch_select, tas2783_ch_values);
 
+/*
+ * PX13: same as the generic enum put, plus remember the selected cluster
+ * index so a re-initialisation restores the Left/Right assignment.
+ */
+static int tas2783_ch_put(struct snd_kcontrol *kcontrol,
+			  struct snd_ctl_elem_value *ucontrol)
+{
+	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
+	struct tas2783_prv *tas_dev = snd_soc_component_get_drvdata(component);
+	struct soc_enum *e = (struct soc_enum *)kcontrol->private_value;
+	unsigned int item = ucontrol->value.enumerated.item[0];
+	int ret;
+
+	if (item >= e->items)
+		return -EINVAL;
+
+	ret = snd_soc_put_enum_double(kcontrol, ucontrol);
+	if (ret >= 0) {
+		tas_dev->user_ch = snd_soc_enum_item_to_val(e, item);
+		tas_dev->user_ch_set = true;
+	}
+	return ret;
+}
+
 static const struct snd_kcontrol_new tas2783_snd_controls[] = {
 	SOC_SINGLE_RANGE_EXT_TLV("Amp Volume", TAS2783_AMP_LEVEL,
 				 1, 0, 20, 0, tas2783_amp_getvol,
@@ -642,7 +727,8 @@ static const struct snd_kcontrol_new tas2783_snd_controls[] = {
 	SOC_SINGLE_RANGE_EXT_TLV("Speaker Volume", TAS2783_DVC_LVL,
 				 0, 0, 200, 1, tas2783_digital_getvol,
 				 tas2783_digital_putvol, tas2781_dvc_tlv),
-	SOC_ENUM("Channel Playback", tas2783_ch_enum),
+	SOC_ENUM_EXT("Channel Playback", tas2783_ch_enum,
+		     snd_soc_get_enum_double, tas2783_ch_put),
 };
 
 static s32 tas2783_validate_calibdata(struct tas2783_prv *tas_dev,
@@ -810,51 +896,31 @@ static s32 tas_fw_get_next_file(const u8 *data, struct tas_fw_file *file)
 	return file->length + sizeof(u32) * 5;
 }
 
-static void tas2783_fw_ready(const struct firmware *fmw, void *context)
+/*
+ * Parse a firmware image and send every file in it to the amp. Split out of
+ * tas2783_fw_ready() (PX13) so that a re-initialisation can replay the image
+ * kept in memory without going through the firmware loader.
+ */
+static s32 tas2783_fw_download(struct tas2783_prv *tas_dev, const u8 *buf,
+			       size_t img_sz)
 {
-	struct tas2783_prv *tas_dev =
-		(struct tas2783_prv *)context;
-	const u8 *buf = NULL;
-	s32  img_sz, ret = 0, cur_file = 0;
+	s32 ret = 0, cur_file = 0;
 	s32 offset = 0;
 
 	struct tas_fw_hdr *hdr __free(kfree) = kzalloc_obj(*hdr);
 	struct tas_fw_file *file __free(kfree) = kzalloc_obj(*file);
-	if (!file || !hdr) {
-		ret = -ENOMEM;
-		goto out;
-	}
+	if (!file || !hdr)
+		return -ENOMEM;
 
-	/* firmware binary not found*/
-	if (!fmw || !fmw->data) {
-		if (!tas_dev->fw_use_fallback) {
-			tas_dev->fw_use_fallback = true;
-			dev_info(tas_dev->dev,
-				"Failed to read preferred fw binary: %s, attempting fallback binary load\n",
-				tas_dev->rca_binaryname);
-		} else {
-			dev_err(tas_dev->dev,
-				"Failed to read fallback fw binary %s\n",
-				tas_dev->rca_binaryname);
-		}
-
-		ret = -EINVAL;
-		goto out;
-	}
-
-	img_sz = fmw->size;
-	buf = fmw->data;
 	offset += tas_fw_read_hdr(buf, hdr);
 	if (hdr->size != img_sz) {
-		ret = -EINVAL;
 		dev_err(tas_dev->dev, "firmware size mismatch with header");
-		goto out;
+		return -EINVAL;
 	}
 
 	if (img_sz < FW_DL_OFFSET) {
-		ret = -EINVAL;
 		dev_err(tas_dev->dev, "unexpected size, size is too small");
-		goto out;
+		return -EINVAL;
 	}
 
 	mutex_lock(&tas_dev->pde_lock);
@@ -879,11 +945,46 @@ static void tas2783_fw_ready(const struct firmware *fmw, void *context)
 	}
 	mutex_unlock(&tas_dev->pde_lock);
 
+	if (ret < 0)
+		return ret;
 	if (cur_file == 0) {
 		dev_err(tas_dev->dev, "fw with no files");
+		return -EINVAL;
+	}
+	tas2783_update_calibdata(tas_dev);
+	return 0;
+}
+
+static void tas2783_fw_ready(const struct firmware *fmw, void *context)
+{
+	struct tas2783_prv *tas_dev =
+		(struct tas2783_prv *)context;
+	s32 ret = 0;
+
+	/* firmware binary not found*/
+	if (!fmw || !fmw->data) {
+		if (!tas_dev->fw_use_fallback) {
+			tas_dev->fw_use_fallback = true;
+			dev_info(tas_dev->dev,
+				"Failed to read preferred fw binary: %s, attempting fallback binary load\n",
+				tas_dev->rca_binaryname);
+		} else {
+			dev_err(tas_dev->dev,
+				"Failed to read fallback fw binary %s\n",
+				tas_dev->rca_binaryname);
+		}
+
 		ret = -EINVAL;
-	} else {
-		tas2783_update_calibdata(tas_dev);
+		goto out;
+	}
+
+	ret = tas2783_fw_download(tas_dev, fmw->data, fmw->size);
+
+	/* PX13: keep the image so a re-init after s2idle needs no loader */
+	if (!ret && !tas_dev->fw_img) {
+		tas_dev->fw_img = kmemdup(fmw->data, fmw->size, GFP_KERNEL);
+		if (tas_dev->fw_img)
+			tas_dev->fw_img_sz = fmw->size;
 	}
 
 out:
@@ -1247,6 +1348,19 @@ static s32 tas_fw_load(struct tas2783_prv *tas_dev, struct sdw_slave *slave)
 	s32 ret;
 	u8 unique_id = tas_dev->sdw_peripheral->id.unique_id;
 
+	/* PX13: replay the image kept from the first successful download */
+	if (tas_dev->fw_img) {
+		ret = tas2783_fw_download(tas_dev, tas_dev->fw_img,
+					  tas_dev->fw_img_sz);
+		if (ret) {
+			dev_err(tas_dev->dev,
+				"fw re-download from memory failed: %d\n", ret);
+			return ret;
+		}
+		tas_dev->fw_dl_success = true;
+		return 0;
+	}
+
 	tas_generate_fw_name(slave, tas_dev->rca_binaryname,
 			     sizeof(tas_dev->rca_binaryname));
 
@@ -1271,10 +1385,40 @@ static s32 tas_fw_load(struct tas2783_prv *tas_dev, struct sdw_slave *slave)
 	return 0;
 }
 
+/* PX13: re-apply what userspace last set, after the init sequence reset it */
+static void tas_restore_user_state(struct tas2783_prv *tas_dev)
+{
+	int ret;
+
+	if (tas_dev->user_ch_set) {
+		ret = regmap_write(tas_dev->regmap,
+				   SDW_SDCA_CTL(1, TAS2783_SDCA_ENT_PPU21,
+						SDCA_CTL_UDMPU_CLUSTERINDEX, 0),
+				   tas_dev->user_ch);
+		if (ret)
+			dev_warn(tas_dev->dev, "channel restore failed: %d\n", ret);
+	}
+	if (tas_dev->user_amp_set) {
+		ret = regmap_write(tas_dev->regmap, TAS2783_AMP_LEVEL,
+				   tas_dev->user_amp_lvl);
+		if (ret)
+			dev_warn(tas_dev->dev, "amp volume restore failed: %d\n", ret);
+	}
+	if (tas_dev->user_dvc_set) {
+		ret = regmap_write(tas_dev->regmap, TAS2783_DVC_LVL,
+				   tas_dev->user_dvc_lvl);
+		if (ret)
+			dev_warn(tas_dev->dev, "speaker volume restore failed: %d\n", ret);
+	}
+}
+
 static s32 tas_io_init(struct device *dev, struct sdw_slave *slave)
 {
 	struct tas2783_prv *tas_dev = dev_get_drvdata(dev);
 	s32 ret;
+
+	/* PX13: the status thread and the retry work must not overlap */
+	guard(mutex)(&tas_dev->init_lock);
 
 	if (tas_dev->hw_init)
 		return 0;
@@ -1301,14 +1445,66 @@ static s32 tas_io_init(struct device *dev, struct sdw_slave *slave)
 			ret = regmap_multi_reg_write(tas_dev->regmap, tas2783_init_seq,
 						     ARRAY_SIZE(tas2783_init_seq));
 
-		if (ret)
+		if (ret) {
 			dev_err(tas_dev->dev,
 				"init writes failed, err=%d", ret);
-		else
+		} else {
 			tas_dev->hw_init = true;
+			tas_restore_user_state(tas_dev);
+		}
 	}
 
 	return ret;
+}
+
+/*
+ * PX13: bounded retry of a failed (re-)initialisation. Seen on long s2idle
+ * sleeps: the firmware download timed out on re-attach, tas_update_status()
+ * returned -EAGAIN once, and the amp stayed silent for the rest of the
+ * session ("error playback without fw download").
+ */
+static void tas2783_init_work(struct work_struct *work)
+{
+	struct tas2783_prv *tas_dev =
+		container_of(work, struct tas2783_prv, init_work.work);
+	struct device *dev = tas_dev->dev;
+	s32 ret;
+
+	if (tas_dev->status != SDW_SLAVE_ATTACHED)
+		return;
+	if (tas_dev->hw_init && tas_dev->fw_dl_success)
+		return;
+
+	ret = pm_runtime_resume_and_get(dev);
+	if (ret < 0) {
+		dev_warn(dev, "init retry: runtime resume failed: %d\n", ret);
+		goto reschedule;
+	}
+
+	dev_info(dev, "init retry %u/%u\n", tas_dev->init_retries + 1,
+		 TAS2783_INIT_RETRIES);
+	regcache_cache_only(tas_dev->regmap, false);
+	regcache_drop_region(tas_dev->regmap, 0, UINT_MAX);
+	tas_dev->hw_init = false;
+	ret = tas_io_init(dev, tas_dev->sdw_peripheral);
+
+	pm_runtime_mark_last_busy(dev);
+	pm_runtime_put_autosuspend(dev);
+
+	if (!ret && tas_dev->fw_dl_success) {
+		dev_info(dev, "init retry succeeded\n");
+		return;
+	}
+
+reschedule:
+	if (++tas_dev->init_retries >= TAS2783_INIT_RETRIES) {
+		tas_dev->init_failed = true;
+		dev_err(dev, "init failed after %u retries, amp stays silent\n",
+			tas_dev->init_retries);
+		return;
+	}
+	schedule_delayed_work(&tas_dev->init_work,
+			      msecs_to_jiffies(500 * tas_dev->init_retries));
 }
 
 static s32 tas_update_status(struct sdw_slave *slave,
@@ -1316,14 +1512,17 @@ static s32 tas_update_status(struct sdw_slave *slave,
 {
 	struct tas2783_prv *tas_dev = dev_get_drvdata(&slave->dev);
 	struct device *dev = &slave->dev;
+	s32 ret;
 
 	dev_dbg(dev, "Peripheral status = %s",
 		status == SDW_SLAVE_UNATTACHED ? "unattached" :
 		 status == SDW_SLAVE_ATTACHED ? "attached" : "alert");
 
 	tas_dev->status = status;
-	if (status == SDW_SLAVE_UNATTACHED)
+	if (status == SDW_SLAVE_UNATTACHED) {
 		tas_dev->hw_init = false;
+		cancel_delayed_work(&tas_dev->init_work);
+	}
 
 	/* Perform initialization only if slave status
 	 * is present and hw_init flag is false
@@ -1353,8 +1552,50 @@ static s32 tas_update_status(struct sdw_slave *slave,
 	regcache_drop_region(tas_dev->regmap, 0, UINT_MAX);
 
 	/* perform I/O transfers required for Slave initialization */
-	return tas_io_init(&slave->dev, slave);
+	ret = tas_io_init(&slave->dev, slave);
+
+	/* PX13: do not leave the amp silent after one failed attempt */
+	if (ret || !tas_dev->fw_dl_success) {
+		dev_warn(dev, "init failed (%d, fw %s), scheduling retry\n", ret,
+			 tas_dev->fw_dl_success ? "ok" : "missing");
+		tas_dev->init_retries = 0;
+		tas_dev->init_failed = false;
+		schedule_delayed_work(&tas_dev->init_work, msecs_to_jiffies(500));
+	}
+	return ret;
 }
+
+/*
+ * PX13: /sys/bus/soundwire/devices/sdw:.../fw_state - one word so the resume
+ * health check can tell "attached but dead" from "initialised with firmware"
+ * without playing audio: ok | no-fw | init-failed | unattached
+ */
+static ssize_t fw_state_show(struct device *dev, struct device_attribute *attr,
+			     char *buf)
+{
+	struct tas2783_prv *tas_dev = dev_get_drvdata(dev);
+	const char *state;
+
+	if (tas_dev->status != SDW_SLAVE_ATTACHED)
+		state = "unattached";
+	else if (tas_dev->hw_init && tas_dev->fw_dl_success)
+		state = "ok";
+	else if (tas_dev->init_failed)
+		state = "init-failed";
+	else
+		state = "no-fw";
+
+	return sysfs_emit(buf, "%s\n", state);
+}
+static DEVICE_ATTR_RO(fw_state);
+
+static struct attribute *tas2783_px13_attrs[] = {
+	&dev_attr_fw_state.attr,
+	NULL,
+};
+static const struct attribute_group tas2783_px13_group = {
+	.attrs = tas2783_px13_attrs,
+};
 
 /*
  * TAS2783 requires explicit port prepare during playback stream
@@ -1504,9 +1745,15 @@ static s32 tas_sdw_probe(struct sdw_slave *peripheral,
 	tas_dev->hw_init = false;
 	mutex_init(&tas_dev->calib_lock);
 	mutex_init(&tas_dev->pde_lock);
+	mutex_init(&tas_dev->init_lock);
+	INIT_DELAYED_WORK(&tas_dev->init_work, tas2783_init_work);
 
 	init_waitqueue_head(&tas_dev->fw_wait);
 	dev_set_drvdata(dev, tas_dev);
+
+	ret = devm_device_add_group(dev, &tas2783_px13_group);
+	if (ret)
+		dev_warn(dev, "fw_state attribute not created: %d\n", ret);
 	regmap = devm_regmap_init_sdw_mbq_cfg(&peripheral->dev,
 					      peripheral,
 					      &tas_regmap,
@@ -1525,10 +1772,13 @@ static void tas_sdw_remove(struct sdw_slave *peripheral)
 {
 	struct tas2783_prv *tas_dev = dev_get_drvdata(&peripheral->dev);
 
+	cancel_delayed_work_sync(&tas_dev->init_work);
 	pm_runtime_disable(tas_dev->dev);
 	tas_remove(tas_dev);
+	kfree(tas_dev->fw_img);
 	mutex_destroy(&tas_dev->calib_lock);
 	mutex_destroy(&tas_dev->pde_lock);
+	mutex_destroy(&tas_dev->init_lock);
 	dev_set_drvdata(&peripheral->dev, NULL);
 }
 
