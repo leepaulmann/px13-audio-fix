@@ -20,10 +20,15 @@
 # Only a power cycle clears it. Seen 2026-09-05 on a HN7306EA, roughly 1 resume
 # in 10 before the settle delay in px13-soundwire-recover.sh was raised to 10s.
 #
-# panic_on_oops=1 stops the kernel AT the oops instead of letting it limp on
-# with a leaked lock; panic=10 then reboots 10s later. panic_on_oops alone is
-# not enough: kernel.panic defaults to 0, which hangs at the panic screen and
-# buys you nothing.
+# oops=panic stops the kernel AT the oops instead of letting it limp on with a
+# leaked lock; panic=10 then reboots 10s later. panic_on_oops alone is not
+# enough: kernel.panic defaults to 0, which hangs at the panic screen and buys
+# you nothing.
+#
+# Two places, on purpose: the cmdline (oops=panic panic=10 - note that
+# "panic_on_oops=1" is only a sysctl name, on the cmdline the kernel ignores
+# it) and /etc/sysctl.d/99-px13-oops-panic.conf, which systemd-sysctl applies
+# at boot even when the UKI has not been rebuilt yet.
 #
 # This does NOT fix the driver bug. It makes the failure legible and
 # self-clearing, and it makes the bug practical to chase - each hit becomes a
@@ -31,17 +36,19 @@
 set -euo pipefail
 
 CONF_NAME=oops-panic.conf
-PARAMS="panic_on_oops=1 panic=10"
+PARAMS="oops=panic panic=10"
+SYSCTL_NAME=99-px13-oops-panic.conf
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LIMINE_DROPIN_DIR=/etc/limine-entry-tool.d
 
 root_run() { if [ "$(id -u)" = 0 ]; then "$@"; else sudo "$@"; fi; }
 
-echo "==> 1/3 Applying $PARAMS to the running kernel"
-root_run sysctl -w kernel.panic_on_oops=1 kernel.panic=10 >/dev/null
-echo "    OK (live now, no reboot needed for this half)"
+echo "==> 1/3 Applying kernel.panic_on_oops=1 kernel.panic=10 (live + /etc/sysctl.d)"
+root_run install -Dm644 "$REPO/configs/$SYSCTL_NAME" "/etc/sysctl.d/$SYSCTL_NAME"
+root_run sysctl -q -p "/etc/sysctl.d/$SYSCTL_NAME"
+echo "    OK (live now; /etc/sysctl.d/$SYSCTL_NAME re-applies it at every boot)"
 
-echo "==> 2/3 Persisting across reboots"
+echo "==> 2/3 Kernel command line ($PARAMS)"
 if [ -d "$LIMINE_DROPIN_DIR" ]; then
   # limine-entry-tool assembles the cmdline from /etc/kernel/cmdline plus these
   # drop-ins. A drop-in survives package updates that rewrite the vendor's own
@@ -78,14 +85,17 @@ printf '    running kernel : panic_on_oops=%s panic=%s\n' \
 if [ -d "$LIMINE_DROPIN_DIR" ] && command -v objcopy >/dev/null 2>&1; then
   UKI="$(ls -1 /boot/EFI/Linux/*.efi 2>/dev/null | head -1 || true)"
   if [ -n "${UKI:-}" ]; then
-    if root_run objcopy -O binary --only-section=.cmdline "$UKI" /dev/stdout 2>/dev/null \
-         | tr -d '\0' | grep -q "panic_on_oops=1"; then
+    CMDLINE="$(root_run objcopy -O binary --only-section=.cmdline "$UKI" /dev/stdout 2>/dev/null | tr -d '\0')"
+    if echo "$CMDLINE" | grep -q "oops=panic"; then
       echo "    embedded UKI cmdline : OK ($UKI)"
     else
-      echo "    WARNING: panic_on_oops not found in $UKI - did limine-update run?"
+      echo "    WARNING: oops=panic not found in $UKI - did limine-update run?"
+    fi
+    if echo "$CMDLINE" | grep -q "panic_on_oops=1"; then
+      echo "    WARNING: the old, ineffective 'panic_on_oops=1' token is still embedded - rerun limine-update"
     fi
   fi
 fi
 echo
 echo "Done. An oops now reboots after 10s instead of freezing."
-echo "To revert: rm $LIMINE_DROPIN_DIR/$CONF_NAME && sudo limine-update"
+echo "To revert: rm $LIMINE_DROPIN_DIR/$CONF_NAME /etc/sysctl.d/$SYSCTL_NAME && sudo limine-update"
