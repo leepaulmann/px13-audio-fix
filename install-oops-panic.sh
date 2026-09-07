@@ -83,7 +83,8 @@ echo "==> 3/3 Verifying"
 printf '    running kernel : panic_on_oops=%s panic=%s\n' \
   "$(cat /proc/sys/kernel/panic_on_oops)" "$(cat /proc/sys/kernel/panic)"
 if [ -d "$LIMINE_DROPIN_DIR" ] && command -v objcopy >/dev/null 2>&1; then
-  UKI="$(ls -1 /boot/EFI/Linux/*.efi 2>/dev/null | head -1 || true)"
+  # /boot is root-only on Omarchy, so list it as root or the check is skipped
+  UKI="$(root_run sh -c 'ls -1 /boot/EFI/Linux/*.efi 2>/dev/null | head -1' || true)"
   if [ -n "${UKI:-}" ]; then
     CMDLINE="$(root_run objcopy -O binary --only-section=.cmdline "$UKI" /dev/stdout 2>/dev/null | tr -d '\0')"
     if echo "$CMDLINE" | grep -q "oops=panic"; then
