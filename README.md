@@ -55,7 +55,7 @@ series). On the PX13 two problems remain:
 |---|---------|---------|------------------|
 | 1 | **On 7.1:** the machine driver does not tag the card with `spk:tas2783`, so `alsa-ucm-conf` never creates the Speaker device. **On 7.2** the kernel *does* emit the tag — but `alsa-ucm-conf` ships nothing for tas2783, so UCM now tries to load a `sof-soundwire/tas2783.conf` that does not exist | 7.1: no sound / "Dummy Output" / only pro-audio. 7.2: the card's UCM fails to open outright (`failed to import hw:1 use case configuration -2`) | The three UCM files in `configs/` (they are what `alsa-ucm-conf` is missing) plus the **long-name override** that pulls in the codec init |
 | 2 | The driver initializes **both** amps with DSP cluster index `0x01` (the ASUS ACPI tables carry no usable SDCA/DisCo function data, so the driver falls back to a static init sequence) | Mono from **one** speaker — which one can change between boots — or a phantom "center" image | Small **DKMS module** (stock driver + channel-selection control) + UCM setting `Left`/`Right` per amp |
-| 3 | s2idle kills the audio stack in **two layers**: the slaves drop off the SoundWire bus (a plain PCI unbind/bind of `snd_pci_ps` does **not** bring them back), and even when the bus still reports `Attached` the TAS2783 DSP has lost its **firmware** (`error playback without fw download` — silent mute while every mixer level looks fine) | Speakers dead/mute after suspend; the vanished card also wedges the WirePlumber graph so even **Bluetooth** audio stops | Detached `systemd-sleep` hook (`systemd-run`) + full module-stack reload → re-probe re-downloads the firmware ([details](#suspendresume-s2idle-recovery)) |
+| 3 | s2idle power-gates the ACP; the amps come back `Attached` but have lost all register and DSP state, and the stock driver (a) syncs a **stale regcache** back before re-initialising, so later power-up writes are skipped, (b) never powers the Function up on a re-prepared stream, (c) never re-prepares the SoundWire ports on `SNDRV_PCM_IOCTL_RESUME`, and (d) gives the firmware re-download 3 s, which times out after long sleeps | Speakers silent after suspend while every mixer level looks fine; sometimes `fw request, wait_event timeout` / `Update Slave status failed` in dmesg | The four kernel-7.3 fixes backported into the two **DKMS modules** (codec + `sdw_utils`), plus firmware kept in memory and a bounded retry. A detached `systemd-sleep` hook stays as a **health-checked fallback** ([details](#suspendresume-s2idle-recovery)) |
 
 Bug #2 is **not** fixed in 7.2 or 7.3-rc1 either (same fallback init, still no
 channel control upstream). The one-speaker report in
@@ -75,7 +75,8 @@ git clone https://github.com/leepaulmann/px13-audio-fix.git && cd px13-audio-fix
 bash install-durable.sh        # asks for sudo when needed
 bash install-resume-recovery.sh   # survive suspend/resume
 bash install-oops-panic.sh        # optional: reboot on oops instead of freeze
-# reboot once if the module can't be live-reloaded
+# then reload the whole SoundWire stack once (or reboot):
+sudo PX13_RECOVER_POLICY=always bash test-sdw-module-reload.sh
 ```
 
 `sudo bash install-durable.sh` works too: the installer needs root for the
@@ -165,6 +166,8 @@ on an API that moves. Twice now an update has degraded the audio **silently**:
 | 7.3-rc1 | the same function *lost* that parameter again | same, if built from the 7.2 source |
 | 7.2 | the kernel started tagging the card `spk:tas2783` — while `alsa-ucm-conf` (1.2.16.1) still ships no tas2783 config | on a machine **without** this repo, worse than 7.1: UCM cannot open the card at all instead of silently skipping the Speaker device |
 | (any) | a driver swap under a live WirePlumber | the stored per-route volume can come back at **0%** — sink unmuted, HiFi active, `paplay` exits 0, and nothing comes out |
+| new **series** (7.1 → 7.2) | the `sdw_utils` DKMS package is pinned to one kernel series (`BUILD_EXCLUSIVE_KERNEL`), so DKMS skips it and the **stock** `snd_soc_sdw_utils` loads | a PCM that was open across suspend (the speaker always is) comes back running but silent, no error anywhere. Fix: `cd module-sdw-utils && ./fetch-sources.sh && bash ../install-durable.sh` |
+| ≥ 7.3 | both packages' resume fixes are in-tree | nothing breaks; the `sdw_utils` package can be dropped (`dkms remove snd-soc-sdw-utils-px13/<ver> --all`) |
 
 Nothing logs an error for either of these, which is why there is a checker:
 
@@ -172,10 +175,12 @@ Nothing logs an error for either of these, which is why there is a checker:
 bash check-audio.sh
 ```
 
-It verifies the four invariants — patched module in `updates/`, DKMS built for
-the running kernel, both amps on different channels, and a speaker sink that is
-neither muted nor at 0% — and prints the exact command to fix each one. Run it
-after every kernel update; exit code is non-zero if anything is off.
+It verifies the invariants — both patched modules in `updates/` (and the same
+build in memory as on disk), DKMS built for the running kernel, both amps on
+different channels, a speaker sink that is neither muted nor at 0%, each amp's
+`fw_state` = `ok`, the recovery policy, and `kernel.panic_on_oops` — and prints
+the exact command to fix each one. Run it after every kernel update; exit code
+is non-zero if anything is off.
 
 Verified on 7.2.2 by pointing `ALSA_CONFIG_UCM2` at a copy of the system tree:
 with none of this repo's files, `alsaucm -c1 list _devices/HiFi` dies with
@@ -189,55 +194,75 @@ The proper upstream fix for this half now belongs in **alsa-ucm-conf**, not the
 kernel: a `sof-soundwire/tas2783.conf` and `codecs/tas2783/` upstream would
 retire two of the three files here.
 
-The module now carries a `LINUX_VERSION_CODE` guard on that call and builds
-clean on 7.2 and 7.3-rc1. Upstream 7.2 also absorbed two of the three local
-patches (the `tas25xx_*_misc` stubs and the `0x` firmware-name prefix, which
-upstream implemented better, with a fallback), so **the entire local delta is
-now the single `Channel Playback` control** — 31 lines over stock.
+The module probes the target kernel's headers at build time for that call and
+builds clean on 7.1.9-arch, 7.2 and 7.3-rc1. Upstream 7.2 also absorbed two of
+the three original local patches (the `tas25xx_*_misc` stubs and the `0x`
+firmware-name prefix). The local delta today is the `Channel Playback`
+control, the three 7.3 resume fixes, and the `PX13:` hardening described in
+[the kernel-side patch](#the-kernel-side-patch-module).
 
 ---
 
 ## Suspend/resume (s2idle) recovery
 
-Three independent failures happen around s2idle on this machine, plus one
-self-inflicted trap. All four were diagnosed on `linux-cachyos 7.1.5-1`:
+**Since 2026-09-07 the amps recover on their own.** The earlier reading of this
+failure — "the slaves vanish from the bus and the firmware is wiped, so reload
+everything" — was wrong about the first half: across 31 logged resumes on a
+HN7306EA every slave was `Attached` before the recovery script did anything,
+and the ALSA card index never changed. What the script saw as a vanished card
+was the card it had just destroyed itself. The real damage is inside the amps:
+when the ACP is power-gated (S0i3) the TAS2783 loses all register and DSP
+state, re-attaches, and the stock driver then
 
-1. **The SoundWire slaves vanish.** After resume the devices under
-   `/sys/bus/soundwire/devices/sdw:0:1:*` are gone (or stuck `UNATTACHED`).
-   A plain unbind/bind of the `snd_pci_ps` PCI device — the classic advice,
-   and what the old hook here did — no longer re-enumerates them.
-2. **The TAS2783 firmware is wiped even when the bus looks healthy.** On some
-   resumes the slaves stay `Attached`, every mixer switch is on, the sink is
-   unmuted, the HiFi profile is active — and the speakers are silent. dmesg
-   has the smoking gun: `error playback without fw download`. The amp's DSP
-   lost its firmware and only a full driver **re-probe** re-downloads it
-   (`/lib/firmware/ti/audio/tas2783/`). This is why "check if it's Attached
-   and skip" is a bug: recovery must run **unconditionally**.
-3. **The wedged card takes Bluetooth down with it.** The vanished ALSA card
-   leaves WirePlumber's graph broken ("PipeWire links failed to activate"):
-   BT devices connect but no stream can link to them. Only a PipeWire/
-   WirePlumber restart clears it.
-4. **The trap: doing any of this inline in a system-sleep hook.** Post hooks
-   block `systemd-suspend.service`, and systemd keeps the user session
-   (`user.slice`) **frozen** until the service finishes. An inline recovery
-   means a black screen for up to the 90 s service timeout on every wake —
-   and a guaranteed deadlock if the hook tries to restart the session's
-   PipeWire (which is frozen, waiting for the hook).
+1. **syncs a stale regcache** back before re-initialising, so the later DAPM
+   power-up and PDE writes compare equal to the cache and never reach the
+   hardware — playback runs, no error, silent speakers;
+2. on a stream that is only **re-prepared** (not set up again) never powers
+   the SDCA Function up, so the port never finishes channel preparation;
+3. on `SNDRV_PCM_IOCTL_RESUME` — which PipeWire uses on a `SUSPENDED` PCM, and
+   AMD ACP advertises — enables the SoundWire stream without re-preparing the
+   ports (the speaker PCM is always open across suspend because of the
+   WirePlumber no-suspend rule, the mic during a meeting);
+4. gives the firmware re-download 3 s and, when that times out after a long
+   sleep, leaves the amp without firmware for the rest of the session
+   (`fw request, wait_event timeout` → `Update Slave status failed:-11`).
 
-The fix is therefore split:
+Andrey Golovko fixed 1–3 upstream in **Linux 7.3-rc1**, measured on a PX13
+HN7306EAC (`b627da43035`, `119046319e77`, `0c7aeb0f5ece` in `tas2783-sdw.c`;
+`6fd1b9225de1` in `sdw_utils`). Kernels < 7.3 do not have them, so this repo
+carries them:
+
+| Package | Contents |
+|---|---|
+| `module/` → `snd-soc-tas2783-sdw-px13` | the three codec fixes, plus (`PX13:` in the source) the firmware image kept in memory and replayed on re-init instead of going through the firmware loader, a bounded retry when re-init fails, the last `Channel Playback` / volumes re-applied after the init sequence (which would otherwise leave both amps on cluster `0x01` = mono and the digital volume at 0 dB), and `/sys/bus/soundwire/devices/sdw:*/fw_state` (`ok`, `no-fw`, `init-failed`, `unattached`) |
+| `module-sdw-utils/` → `snd-soc-sdw-utils-px13` | the stock `snd_soc_sdw_utils` rebuilt from the running kernel's linux-stable tag (`fetch-sources.sh`) with the RESUME re-prepare fix; pinned to that kernel series with `BUILD_EXCLUSIVE_KERNEL` |
+
+The audio outage after a healthy resume drops from ~20 s (reload + PipeWire
+restart) to nothing, PipeWire is never restarted — so **Brave keeps its
+microphone** — and the PCI teardown that could oops the kernel (section 5) does
+not run.
+
+### The fallback
+
+The sleep hook stays installed, but it is now a health check first:
 
 | File (repo) | Installed to | Purpose |
 |---|---|---|
-| `50-px13-soundwire` | `/usr/lib/systemd/system-sleep/` | post hook: dispatches the recovery as a transient unit (`systemd-run --no-block --collect`) and exits immediately — the screen is back in ~3 s |
-| `px13-soundwire-recover.sh` | `/usr/local/lib/` | the actual recovery, ~30 s in the background: unbind PCI → unload the whole SoundWire/ACP module stack (children first) → reload → wait for `Attached` (probe re-downloads the amp firmware) → **always** restart the session PipeWire → reapply HiFi profile, unmute, restore default sink only if nothing better holds it |
-| `lib/px13-detect.sh` | `/usr/local/lib/px13-audio-detect.sh` | the probes, shared by every script |
-| — | `/etc/px13-audio-fix.conf` | cache of the ACP PCI address and long name, written while the hardware is healthy — the recovery needs them precisely when the card has already vanished from `/proc/asound` |
-| `test-sdw-module-reload.sh` | — | interactive version of the same recovery; `sudo` it to bring audio back *right now* (plays a test sound and reports SUCCESS/FAIL) |
+| `50-px13-soundwire` | `/usr/lib/systemd/system-sleep/` | post hook: dispatches the recovery as a transient unit (`systemd-run --no-block --collect`) and exits immediately — running it inline keeps the user session frozen (black screen) until it finishes |
+| `px13-soundwire-recover.sh` | `/usr/local/lib/` | after a 10 s settle: `PX13_RECOVER_POLICY` **auto** (default) = reload only if a slave is missing, an amp's `fw_state` is not `ok`, or the kernel log since the last `PM: suspend exit` has a SoundWire/codec resume error; **always** = the old unconditional reload; **never** = log and exit. The reload: stop PipeWire (sockets too, or it respawns and holds `/dev/snd`) → unbind PCI → unload the stack children first → reload → wait for `Attached` → start PipeWire → HiFi profile, unmute, default sink only if nothing better holds it → restart Chromium/Electron audio services so browsers list the mic again |
+| `lib/px13-detect.sh` | `/usr/local/lib/px13-audio-detect.sh` | the probes and the health helpers, shared by every script |
+| — | `/etc/px13-audio-fix.conf` | cache of the ACP PCI address and long name, plus `PX13_RECOVER_POLICY` (editable) |
+| `test-sdw-module-reload.sh` | — | the same reload interactively (`sudo`, forces `always`); also the way to activate a newer build of either module without a reboot |
 
-Install all of it with `bash install-resume-recovery.sh` (it also does a dry run
-with a healthy bus, so you find out it works without having to suspend).
+Install it with `bash install-resume-recovery.sh` (its one-off dry run forces
+`always`, so you see the reload work without suspending). Everything is logged
+to `/var/log/px13-soundwire-resume.log`; a healthy resume logs one line
+(`healthy, nothing to do (fw:... slaves:...)`).
 
-Everything is logged to `/var/log/px13-soundwire-resume.log`.
+Known case that still needs the fallback: after very long sleeps the RT721
+headset codec has logged `Initialization not complete, timed out` / `PM: failed
+to resume: error -110` (stock module, not rebuilt here). The health check sees
+it in the journal and reloads.
 
 ### 5. The recovery itself could freeze the machine (fixed 2026-09-05)
 
@@ -278,10 +303,17 @@ sleep "${PX13_RESUME_SETTLE:-10}"
 Raise `PX13_RESUME_SETTLE` if it ever recurs, rather than reaching for a
 different teardown method.
 
+With policy `auto` this teardown only runs when a resume actually failed, so
+the exposure is now rare rather than every wake.
+
 Pair it with `bash install-oops-panic.sh` (optional): a kernel oops then
 reboots after 10 s instead of hanging, which is both kinder to use and what
 makes the bug practical to chase — each hit becomes a logged oops rather than
-a wedge.
+a wedge. Note that the first version of that installer put `panic_on_oops=1`
+on the kernel command line, which is **not** a kernel parameter (only the
+sysctl is; the kernel logs the token as unknown and the setting stayed 0
+after the reboot). It now uses `oops=panic` plus a `/etc/sysctl.d/` file and
+verifies the live sysctl.
 
 **Upstream status: unreported.** The crashing frames are all in-tree core code,
 so it is a legitimate `snd_pci_ps` teardown bug — but the kernel is tainted
@@ -298,32 +330,40 @@ untainted → worth filing. Does not → the bug is in this repo's patch.
 
 | File (repo) | Installed to | Purpose |
 |---|---|---|
-| `module/` | `/usr/src/snd-soc-tas2783-sdw-px13-1.0` (DKMS) | Stock 7.1.y tas2783 driver + `Channel Playback` control |
+| `module/` | `/usr/src/snd-soc-tas2783-sdw-px13-1.1` (DKMS) | Stock 7.2.y tas2783 driver + `Channel Playback` control + the 7.3 resume fixes + `PX13:` hardening |
+| `module-sdw-utils/` | `/usr/src/snd-soc-sdw-utils-px13-<kernel tag>` (DKMS, one kernel series) | Stock `snd_soc_sdw_utils` for the running kernel + the 7.3 RESUME re-prepare fix; `fetch-sources.sh` pulls the sources and generates `dkms.conf` |
 | `configs/ucm-card-override.conf.in` | `/usr/share/alsa/ucm2/conf.d/<CardDriver>/<CardLongName>.conf` — **both probed**, template placeholders substituted at install time | Forces the speaker codec; **unowned by any package** → survives `alsa-ucm-conf` updates |
 | `lib/px13-detect.sh` | `/usr/local/lib/px13-audio-detect.sh` | Runtime probes: card, driver, long name, amp count, ACP PCI, PipeWire names |
 | `check-audio.sh` | — | Post-update health check; non-zero exit if any invariant broke |
 | `configs/sof-soundwire_tas2783.conf` | `/usr/share/alsa/ucm2/sof-soundwire/tas2783.conf` | Speaker device for the HiFi profile; sets `tas2783-1 = Left`, `tas2783-2 = Right` on every profile activation (guarded on the **second** amp existing, so a single-amp variant still gets a mono Speaker instead of a broken profile) |
 | `configs/codecs_tas2783_init.conf` | `/usr/share/alsa/ucm2/codecs/tas2783/init.conf` | Volume-control remap (supports both driver generations) |
-| `50-px13-soundwire` | `/usr/lib/systemd/system-sleep/` | Recovers SoundWire after s2idle |
+| `50-px13-soundwire` | `/usr/lib/systemd/system-sleep/` | Health-checked fallback after s2idle (`PX13_RECOVER_POLICY` in `/etc/px13-audio-fix.conf`) |
 | `configs/99-echo-cancel.conf` | `~/.config/pipewire/pipewire.conf.d/` | Optional: echo-cancelled mic source for calls |
 | `configs/51-amd-sdw-channels.conf` | `~/.config/wireplumber/wireplumber.conf.d/` | Optional: FL/FR channel positions on the speaker node |
-| `configs/oops-panic.conf` | `/etc/limine-entry-tool.d/` (limine only) | Optional: `panic_on_oops=1 panic=10` so a kernel oops reboots instead of freezing — install with `bash install-oops-panic.sh`, which falls back to printing GRUB/systemd-boot instructions on other bootloaders |
+| `configs/oops-panic.conf`, `configs/99-px13-oops-panic.conf` | `/etc/limine-entry-tool.d/` (limine only), `/etc/sysctl.d/` | Optional: `oops=panic panic=10` on the cmdline and `kernel.panic_on_oops=1` via sysctl so a kernel oops reboots instead of freezing — install with `bash install-oops-panic.sh`, which falls back to printing GRUB/systemd-boot instructions on other bootloaders |
 
 ### The kernel-side patch (module/)
 
-The DKMS module is the stock `linux-7.2.y` `tas2783-sdw.c` with one functional
-addition — nealstar's channel-selection control rebased onto the upstream
-driver (plus a `LINUX_VERSION_CODE` guard on the one call whose signature
-differs on 7.3+):
+The DKMS module is the stock `linux-7.2.y` `tas2783-sdw.c` plus:
 
-```
-tas2783-N Channel Playback : enum { Off, Left, Right }
-```
+- nealstar's channel-selection control rebased onto the upstream driver:
 
-It writes the SDCA control `PPU21 / UDMPU CLUSTERINDEX` (values `0 / 1 / 4`),
-which tells each amp's DSP which channel of the stereo stream to render.
-Without it both amps stay at the boot value `0x01` written by
-`tas2783_init_seq`.
+  ```
+  tas2783-N Channel Playback : enum { Off, Left, Right }
+  ```
+
+  It writes the SDCA control `PPU21 / UDMPU CLUSTERINDEX` (values `0 / 1 / 4`),
+  which tells each amp's DSP which channel of the stereo stream to render.
+  Without it both amps stay at the boot value `0x01` written by
+  `tas2783_init_seq`.
+- the three 7.3-rc1 resume fixes (see the s2idle section), applied by hand and
+  labelled with their upstream commit ids in the source;
+- `PX13:`-labelled hardening: firmware image retained in memory and replayed on
+  re-init (`tas2783_fw_download()`), a mutex-serialised bounded retry
+  (`tas2783_init_work`), user-set channel/volume values restored after the init
+  sequence (`tas_restore_user_state()`), and the `fw_state` sysfs attribute;
+- build-time probes of the target kernel's headers for the two SDCA/SoundWire
+  calls whose signatures differ between trees.
 
 ---
 
@@ -401,12 +441,13 @@ channel, since the PX13's ACPI provides no usable SDCA function data
 this repo keeps working setups alive across updates. Progress is tracked in
 [CachyOS/linux-cachyos#737](https://github.com/CachyOS/linux-cachyos/issues/737).
 
-The s2idle behavior is a **second kernel bug** worth reporting upstream
-(ALSA/SoundWire): `tas2783-sdw` should re-download the DSP firmware in its
-system-resume path (today it can come back `Attached` with no firmware and
-mutes silently), and the AMD SoundWire manager (`soundwire_amd` /
-`snd_pci_ps`) fails to re-enumerate its slaves after s2idle on Strix Halo —
-a full module reload should not be necessary.
+The s2idle state loss **is fixed upstream** in Linux 7.3-rc1 (Andrey Golovko,
+`ASoC: tas2783-sdw: drop stale regcache on uninitialized re-attach` and
+siblings; see the s2idle section). Until a ≥ 7.3 kernel is installed this
+repo backports them. Still local: the firmware-in-memory replay and retry,
+the user-state restore after re-init, and the `fw_state` attribute — worth
+proposing upstream once they have some mileage. The `release_resource()` oops
+in the old unconditional teardown (section 5) is unreported.
 
 ## Credits
 
