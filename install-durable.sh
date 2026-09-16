@@ -68,19 +68,31 @@ echo "==> 1/8 Kernel modules (needs root)"
 #   snd-soc-tas2783-sdw : 'Channel Playback' control + the 7.3 resume fixes
 #   snd-soc-sdw-utils   : the 7.3 RESUME re-prepare fix; sources are fetched
 #                         for the running kernel series (module-sdw-utils/)
-if [ ! -f "$REPO/module-sdw-utils/src/objects.mk" ] || [ ! -f "$REPO/module-sdw-utils/dkms.conf" ]; then
-  echo "    fetching sdw_utils sources for $KREL"
-  "$REPO/module-sdw-utils/fetch-sources.sh" || fail "could not fetch the sdw_utils sources (network?)"
+# The sdw_utils package is only for kernels whose in-tree copy lacks the fix
+# (7.3 and distro backports such as linux-omarchy 7.2.5 have it). Skipping it
+# there also leaves the package registered for the kernels that still need it.
+SDWU_NEEDED=1
+if px13_sdw_utils_has_resume_fix "$KREL"; then
+  SDWU_NEEDED=0
+  echo "    $KREL: in-tree snd_soc_sdw_utils already has the RESUME fix - no sdw_utils package"
 fi
-SDWU_VER="$(sed -n 's/^PACKAGE_VERSION="\(.*\)"/\1/p' "$REPO/module-sdw-utils/dkms.conf")"
-[ -n "$SDWU_VER" ] || fail "module-sdw-utils/dkms.conf has no PACKAGE_VERSION - rerun module-sdw-utils/fetch-sources.sh"
+if [ "$SDWU_NEEDED" = 1 ]; then
+  if [ ! -f "$REPO/module-sdw-utils/src/objects.mk" ] || [ ! -f "$REPO/module-sdw-utils/dkms.conf" ]; then
+    echo "    fetching sdw_utils sources for $KREL"
+    "$REPO/module-sdw-utils/fetch-sources.sh" || fail "could not fetch the sdw_utils sources (network?)"
+  fi
+  SDWU_VER="$(sed -n 's/^PACKAGE_VERSION="\(.*\)"/\1/p' "$REPO/module-sdw-utils/dkms.conf")"
+  [ -n "$SDWU_VER" ] || fail "module-sdw-utils/dkms.conf has no PACKAGE_VERSION - rerun module-sdw-utils/fetch-sources.sh"
+  ( cd "$REPO/module-sdw-utils" && make KVER="$KREL" clean >/dev/null 2>&1 || true )
+fi
 ( cd "$REPO/module" && make KVER="$KREL" clean >/dev/null 2>&1 || true )
-( cd "$REPO/module-sdw-utils" && make KVER="$KREL" clean >/dev/null 2>&1 || true )
 if command -v dkms >/dev/null 2>&1; then
   # drop an older manual install so it does not compete with the dkms one
   root_run rm -f "/usr/lib/modules/$KREL/updates/snd-soc-tas2783-sdw.ko" \
                  "/usr/lib/modules/$KREL/updates/snd-soc-sdw-utils.ko"
-  for spec in "$DKMS_NAME $DKMS_VER module" "$SDWU_NAME $SDWU_VER module-sdw-utils"; do
+  SPECS=("$DKMS_NAME $DKMS_VER module")
+  [ "$SDWU_NEEDED" = 1 ] && SPECS+=("$SDWU_NAME $SDWU_VER module-sdw-utils")
+  for spec in "${SPECS[@]}"; do
     set -- $spec; name=$1; ver=$2; dir=$3
     # one registered version per package: retire the others first
     for old in $(dkms status "$name" 2>/dev/null | sed -n "s|^$name/\([^,]*\),.*|\1|p" | sort -u); do
@@ -95,21 +107,24 @@ if command -v dkms >/dev/null 2>&1; then
       echo "    $name/$ver OK via DKMS"
     else
       rc=$?
-      # 77 = BUILD_EXCLUSIVE_KERNEL did not match: sources are for another series
+      # 77 = BUILD_EXCLUSIVE_KERNEL did not match: sources are for another
+      # kernel series or flavour
       [ "$rc" = 77 ] && [ "$name" = "$SDWU_NAME" ] \
         && echo "    $name/$ver skipped: not built for $KREL (rerun module-sdw-utils/fetch-sources.sh on this kernel)" \
         || fail "dkms install $name/$ver failed (rc=$rc) - see /var/lib/dkms/$name/$ver/build/make.log"
     fi
   done
-  echo "    (both rebuild themselves on every kernel update; sdw_utils only within its kernel series)"
+  echo "    (they rebuild themselves on every kernel update; sdw_utils only within its kernel series and flavour)"
 else
   echo "    dkms not found - manual build (redo it after every kernel update!)"
   ( cd "$REPO/module" && make KVER="$KREL" )
   root_run install -Dm644 "$REPO/module/snd-soc-tas2783-sdw.ko" \
        "/usr/lib/modules/$KREL/updates/snd-soc-tas2783-sdw.ko"
-  ( cd "$REPO/module-sdw-utils" && make KVER="$KREL" )
-  root_run install -Dm644 "$REPO/module-sdw-utils/snd-soc-sdw-utils.ko" \
-       "/usr/lib/modules/$KREL/updates/snd-soc-sdw-utils.ko"
+  if [ "$SDWU_NEEDED" = 1 ]; then
+    ( cd "$REPO/module-sdw-utils" && make KVER="$KREL" )
+    root_run install -Dm644 "$REPO/module-sdw-utils/snd-soc-sdw-utils.ko" \
+         "/usr/lib/modules/$KREL/updates/snd-soc-sdw-utils.ko"
+  fi
   root_run depmod -a "$KREL"
 fi
 

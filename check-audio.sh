@@ -39,17 +39,23 @@ if command -v dkms >/dev/null 2>&1; then
 fi
 
 # 1b. the sdw_utils module with the RESUME re-prepare fix ---------------------
-KMM="$(uname -r | cut -d. -f1-2)"
 SDWU="$(modinfo -k "$(uname -r)" snd_soc_sdw_utils -F filename 2>/dev/null)"
-if [ "$(printf '%s\n7.3\n' "$KMM" | sort -V | head -1)" = 7.3 ]; then
-  ok "kernel $KMM carries the sdw_utils RESUME fix in-tree (DKMS copy not needed)"
-else
-  case "$SDWU" in
-    */updates/*) ok "sdw_utils RESUME fix installed ($SDWU)" ;;
-    *) warn "sdw_utils RESUME fix NOT active for $(uname -r): a PCM open across suspend comes back silent.
-           New kernel series? cd module-sdw-utils && ./fetch-sources.sh && bash ../install-durable.sh" ;;
-  esac
-fi
+case "$SDWU" in
+  */updates/*) ok "sdw_utils RESUME fix installed ($SDWU)" ;;
+  *)
+    # The stock module may already have it: 7.3, or a distro backport
+    # (linux-omarchy 7.2.5) - so look at the code rather than the version.
+    FIXRC=0; px13_sdw_utils_has_resume_fix "$SDWU" || FIXRC=$?
+    KMM="$(uname -r | cut -d. -f1-2)"
+    if [ "$FIXRC" = 0 ]; then
+      ok "in-tree sdw_utils carries the RESUME fix (DKMS copy not needed)"
+    elif [ "$FIXRC" = 2 ] && [ "$(printf '%s\n7.3\n' "$KMM" | sort -V | head -1)" = 7.3 ]; then
+      ok "kernel $KMM carries the sdw_utils RESUME fix in-tree (DKMS copy not needed; binary not checked)"
+    else
+      warn "sdw_utils RESUME fix NOT active for $(uname -r): a PCM open across suspend comes back silent.
+           New kernel series? cd module-sdw-utils && ./fetch-sources.sh && bash ../install-durable.sh"
+    fi ;;
+esac
 for m in snd_soc_tas2783_sdw snd_soc_sdw_utils; do
   MEM="$(cat /sys/module/$m/srcversion 2>/dev/null)"
   DISK="$(modinfo -k "$(uname -r)" $m -F srcversion 2>/dev/null)"

@@ -31,6 +31,17 @@ for a in "$@"; do
 done
 
 series() { local v="${1#v}"; echo "${v%.*}"; }   # 7.1.9 -> 7.1
+
+HERE_LIB="$HERE/../lib/px13-detect.sh"
+if [ "$FORCE" = 0 ] && [ -f "$HERE_LIB" ]; then
+  # shellcheck source=../lib/px13-detect.sh
+  . "$HERE_LIB"
+  if px13_sdw_utils_has_resume_fix "$KREL"; then
+    echo "$KREL: the in-tree snd_soc_sdw_utils already has the RESUME fix - nothing to build (--force to fetch anyway)"
+    exit 0
+  fi
+fi
+
 if [ "$(series "$TAG")" != "$(series "${KREL%%-*}")" ] && [ "$FORCE" = 0 ]; then
   echo "ERROR: tag $TAG is not the running kernel's series ($KREL); use --force" >&2
   exit 1
@@ -97,10 +108,26 @@ for p in "$HERE"/patches/*.patch; do
   patch -p1 -d "$SRC" --no-backup-if-mismatch -s < "$p"
 done
 
-# dkms.conf: version = tag, BUILD_EXCLUSIVE_KERNEL = this series only. A future
-# kernel series gets the stock module until this script is rerun for it.
+# dkms.conf: version = tag, BUILD_EXCLUSIVE_KERNEL = this series AND this
+# kernel flavour only. A future series gets the stock module until this script
+# is rerun for it. The flavour matters because distro kernels of the same
+# series differ: linux-omarchy 7.2.5-3-omarchy carries the 7.3 SoundWire
+# rework (other sdw_utils API, RESUME fix in-tree), so a series-only pin made
+# DKMS build the Arch 7.2.3 sources there and fail on every kernel update.
+# The flavour is the first alphabetic token of the release suffix
+# (7.2.3-arch1-3 -> arch, 7.2.5-3-omarchy -> omarchy); a bare 7.2.3 pins the
+# series with no suffix.
 SER=$(series "$TAG")
-sed -e "s|@VERSION@|${TAG#v}|" -e "s|@SERIES@|${SER//./\\\\.}|" \
+SER_RE="${SER//./\\.}"
+SUFFIX=""; case "$KREL" in *-*) SUFFIX="${KREL#*-}" ;; esac
+FLAV="$(printf '%s' "$SUFFIX" | grep -oE '[A-Za-z]+' | head -1 || true)"
+if [ -n "$FLAV" ]; then
+  KRE="^${SER_RE}\\.[0-9]+-([0-9]+-)?${FLAV}[0-9.-]*\$"
+else
+  KRE="^${SER_RE}\\.[0-9]+\$"
+fi
+KRE_SED="$(printf '%s' "$KRE" | sed 's/[\\&|]/\\&/g')"
+sed -e "s|@VERSION@|${TAG#v}|" -e "s|@KERNEL_REGEX@|$KRE_SED|" \
     "$HERE/dkms.conf.in" > "$HERE/dkms.conf"
 echo "==> dkms.conf: $(grep -E 'PACKAGE_VERSION|BUILD_EXCLUSIVE' "$HERE/dkms.conf" | tr '\n' ' ')"
 echo "done"

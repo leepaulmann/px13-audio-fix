@@ -281,6 +281,37 @@ px13_resume_errors() {
     || true
 }
 
+# Does this snd_soc_sdw_utils binary re-prepare the stream on TRIGGER_RESUME
+# (upstream 6fd1b9225de1, v7.3-rc1)? Read from the code, not the version:
+# linux-omarchy 7.2.5 has it in-tree, Arch 7.2.3 does not.
+# $1 = module file (.ko, .ko.zst, .ko.xz, .ko.gz), or a kernel release to
+# check that kernel's in-tree (stock) copy. 0 = has the fix, 1 = lacks it,
+# 2 = cannot tell (no objdump/decompressor, or no asoc_sdw_trigger).
+px13_sdw_utils_has_resume_fix() {
+  local ko="$1" tmp dis
+  if [ ! -e "$ko" ]; then
+    # the in-tree copy, or where DKMS archived it when ours replaced it
+    ko="$(ls /usr/lib/modules/"$1"/kernel/sound/soc/sdw_utils/snd-soc-sdw-utils.ko* \
+             /var/lib/dkms/*/original_module/"$1"/*/snd-soc-sdw-utils.ko* 2>/dev/null \
+          | grep -v '\.origin$' | head -1 || true)"
+  fi
+  [ -r "$ko" ] && command -v objdump >/dev/null 2>&1 || return 2
+  tmp="$(mktemp)" || return 2
+  # objdump needs a seekable file, not a pipe
+  case "$ko" in
+    *.zst) zstd -qdc "$ko" ;;
+    *.xz)  xz -dc "$ko" ;;
+    *.gz)  gzip -dc "$ko" ;;
+    *)     cat "$ko" ;;
+  esac > "$tmp" 2>/dev/null
+  dis="$(objdump -dr "$tmp" 2>/dev/null \
+    | awk '/<asoc_sdw_trigger>:/ { on = 1; print; next } on && /^$/ { exit } on' || true)"
+  rm -f "$tmp"
+  [ -n "$dis" ] || return 2
+  printf '%s\n' "$dis" | grep -q 'sdw_prepare_stream' && return 0
+  return 1
+}
+
 # What the user-side `fixmic -a` does: Chromium/Electron keep a dead PulseAudio
 # socket after the sound server restarts and then list zero audio devices. The
 # audio service is a separate process that respawns on demand, so killing it

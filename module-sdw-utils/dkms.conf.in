@@ -5,6 +5,6 @@ DEST_MODULE_LOCATION[0]="/updates"
 MAKE[0]="make KVER=${kernelver}"
 CLEAN="make KVER=${kernelver} clean"
 AUTOINSTALL="yes"
-# Sources are the stable tag of ONE kernel series; never build them against
-# another one (fetch-sources.sh regenerates this file for a new series).
-BUILD_EXCLUSIVE_KERNEL="^@SERIES@\."
+# Sources are the stable tag of ONE kernel series and flavour; never build them
+# against another one (fetch-sources.sh regenerates this file for a new series).
+BUILD_EXCLUSIVE_KERNEL="@KERNEL_REGEX@"
