@@ -158,18 +158,33 @@ non-GOPRO HN7306EA-LX005X too) and confirmed by **@DevGrishin**, in
 ## Kernel updates: what breaks, and how to tell
 
 The DKMS module is a copy of the upstream driver plus one control, so it rides
-on an API that moves. Twice now an update has degraded the audio **silently**:
+on an API that moves. Three times now an update has degraded the audio **silently**:
 
 | Kernel | What changed | What you saw |
 |---|---|---|
 | 7.2 | `sdca_parse_function()` gained a `struct sdw_slave *` parameter | DKMS build failed during the pacman transaction, the **stock** module loaded instead, `Channel Playback` disappeared → mono from one speaker |
 | 7.3-rc1 | the same function *lost* that parameter again | same, if built from the 7.2 source |
+| distro 7.2.y with 7.3 backports (`linux-omarchy` 7.2.5-3) | the 7.3 SDCA/`sdw_utils` API under a **7.2 version code**: the module's `>= 7.3` check picked the old call, and the series-pinned `sdw_utils` package tried to build Arch 7.2.3 sources there | both DKMS builds failed in the transaction; the stock driver brought the resume fixes but no `Channel Playback`, so the **right speaker was silent even on a cold boot**. Fixed by probing the header instead of the version, and by pinning `sdw_utils` to the kernel flavour too |
 | 7.2 | the kernel started tagging the card `spk:tas2783` — while `alsa-ucm-conf` (1.2.16.1) still ships no tas2783 config | on a machine **without** this repo, worse than 7.1: UCM cannot open the card at all instead of silently skipping the Speaker device |
 | (any) | a driver swap under a live WirePlumber | the stored per-route volume can come back at **0%** — sink unmuted, HiFi active, `paplay` exits 0, and nothing comes out |
-| new **series** (7.1 → 7.2) | the `sdw_utils` DKMS package is pinned to one kernel series (`BUILD_EXCLUSIVE_KERNEL`), so DKMS skips it and the **stock** `snd_soc_sdw_utils` loads | a PCM that was open across suspend (the speaker always is) comes back running but silent, no error anywhere. Fix: `cd module-sdw-utils && ./fetch-sources.sh && bash ../install-durable.sh` |
-| ≥ 7.3 | both packages' resume fixes are in-tree | nothing breaks; the `sdw_utils` package can be dropped (`dkms remove snd-soc-sdw-utils-px13/<ver> --all`) |
+| new **series** (7.1 → 7.2) | the `sdw_utils` DKMS package is pinned to one kernel series and flavour (`BUILD_EXCLUSIVE_KERNEL`, e.g. `^7\.2\.[0-9]+-([0-9]+-)?arch[0-9.-]*$`), so DKMS skips it and the **stock** `snd_soc_sdw_utils` loads | a PCM that was open across suspend (the speaker always is) comes back running but silent, no error anywhere. Fix: `cd module-sdw-utils && ./fetch-sources.sh && bash ../install-durable.sh` |
+| ≥ 7.3 (or a backport) | the resume fixes are in-tree, but **not** `Channel Playback`: the stock driver leaves amp2 on cluster 0x01 (Left) | the codec package is still required; the `sdw_utils` one is not. `install-durable.sh`, `fetch-sources.sh` and `check-audio.sh` detect the in-tree fix by disassembling `asoc_sdw_trigger` (it calls `sdw_prepare_stream`), not by version |
 
-Nothing logs an error for either of these, which is why there is a checker:
+Nothing logs an error for any of these. Two tools catch them — **before** the
+reboot, the gate builds everything against every installed kernel (a kernel
+update installs the new headers first, so this sees the kernel you are about
+to boot):
+
+```bash
+./.gate          # exit 1 on any build error/warning or a kernel with no sdw_utils fix
+```
+
+It was checked against the pre-fix module and fails on `linux-omarchy` 7.2.5
+with the same `too many arguments to function 'sdca_parse_function'` DKMS hit.
+Taken from [ftoleedo/px13-audio-fix](https://github.com/ftoleedo/px13-audio-fix);
+this fork adds the per-kernel `sdw_utils` check.
+
+**After** the reboot, the checker:
 
 ```bash
 bash check-audio.sh
@@ -195,7 +210,7 @@ kernel: a `sof-soundwire/tas2783.conf` and `codecs/tas2783/` upstream would
 retire two of the three files here.
 
 The module probes the target kernel's headers at build time for that call and
-builds clean on 7.1.9-arch, 7.2 and 7.3-rc1. Upstream 7.2 also absorbed two of
+builds clean on 7.1.9-arch, 7.2, 7.3-rc1 and `linux-omarchy` 7.2.5. Upstream 7.2 also absorbed two of
 the three original local patches (the `tas25xx_*_misc` stubs and the `0x`
 firmware-name prefix). The local delta today is the `Channel Playback`
 control, the three 7.3 resume fixes, and the `PX13:` hardening described in
@@ -331,10 +346,11 @@ untainted → worth filing. Does not → the bug is in this repo's patch.
 | File (repo) | Installed to | Purpose |
 |---|---|---|
 | `module/` | `/usr/src/snd-soc-tas2783-sdw-px13-1.1` (DKMS) | Stock 7.2.y tas2783 driver + `Channel Playback` control + the 7.3 resume fixes + `PX13:` hardening |
-| `module-sdw-utils/` | `/usr/src/snd-soc-sdw-utils-px13-<kernel tag>` (DKMS, one kernel series) | Stock `snd_soc_sdw_utils` for the running kernel + the 7.3 RESUME re-prepare fix; `fetch-sources.sh` pulls the sources and generates `dkms.conf` |
+| `module-sdw-utils/` | `/usr/src/snd-soc-sdw-utils-px13-<kernel tag>` (DKMS, one kernel series and flavour) | Stock `snd_soc_sdw_utils` for the running kernel + the 7.3 RESUME re-prepare fix; `fetch-sources.sh` pulls the sources and generates `dkms.conf`. Skipped on kernels whose in-tree copy already has the fix |
 | `configs/ucm-card-override.conf.in` | `/usr/share/alsa/ucm2/conf.d/<CardDriver>/<CardLongName>.conf` — **both probed**, template placeholders substituted at install time | Forces the speaker codec; **unowned by any package** → survives `alsa-ucm-conf` updates |
 | `lib/px13-detect.sh` | `/usr/local/lib/px13-audio-detect.sh` | Runtime probes: card, driver, long name, amp count, ACP PCI, PipeWire names |
 | `check-audio.sh` | — | Post-update health check; non-zero exit if any invariant broke |
+| `.gate` | — | Pre-reboot check: module and `sdw_utils` build on every installed kernel, scripts parse |
 | `configs/sof-soundwire_tas2783.conf` | `/usr/share/alsa/ucm2/sof-soundwire/tas2783.conf` | Speaker device for the HiFi profile; sets `tas2783-1 = Left`, `tas2783-2 = Right` on every profile activation (guarded on the **second** amp existing, so a single-amp variant still gets a mono Speaker instead of a broken profile) |
 | `configs/codecs_tas2783_init.conf` | `/usr/share/alsa/ucm2/codecs/tas2783/init.conf` | Volume-control remap (supports both driver generations) |
 | `50-px13-soundwire` | `/usr/lib/systemd/system-sleep/` | Health-checked fallback after s2idle (`PX13_RECOVER_POLICY` in `/etc/px13-audio-fix.conf`) |
