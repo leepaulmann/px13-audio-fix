@@ -216,6 +216,57 @@ firmware-name prefix). The local delta today is the `Channel Playback`
 control, the three 7.3 resume fixes, and the `PX13:` hardening described in
 [the kernel-side patch](#the-kernel-side-patch-module).
 
+### Runbook for the next kernel update (written for 7.3)
+
+This machine runs two kernels side by side: Arch `linux` (7.2.3-arch1-3,
+both DKMS packages) and `linux-omarchy` (7.2.5-3-omarchy, codec package only -
+its in-tree `sdw_utils` already has the RESUME fix). Either one can be the
+rollback for the other from the limine menu.
+
+**Before rebooting** into a new kernel (the update installs its headers first):
+
+```bash
+./.gate          # module + sdw_utils build on every installed kernel
+dkms status      # the codec package must say "installed" for the new kernel
+```
+
+**After rebooting:**
+
+```bash
+bash check-audio.sh                       # NOT under sudo - root cannot see PipeWire
+speaker-test -D pulse -c2 -t wav -l1      # "Front Right" must come from the RIGHT speaker
+sudo rtcwake -m no -s 30 && systemctl suspend   # plain rtcwake -m mem skips the sleep hook
+speaker-test -D pulse -c2 -t wav -l1      # again, after the resume
+tail -3 /var/log/px13-soundwire-resume.log      # expect "healthy, nothing to do"
+# the rt721 jack codec must come back from runtime suspend:
+timeout 3 pacat --playback --device="$(pactl list short sinks | awk '/Headphones/{print $2;exit}')" \
+  --format=s16le --rate=48000 --channels=2 /dev/zero &
+sleep 1.5; cat /sys/bus/soundwire/devices/sdw:*:025d:0721:*/power/runtime_status   # "active"
+journalctl -k -b | grep -E 'rt721.*\(-61\)'   # must print nothing
+```
+
+Optional, when the recovery script or the module stack changed: a real full
+reload, `sudo PX13_RECOVER_POLICY=always bash test-sdw-module-reload.sh`
+(audio drops for ~15 s; it plays a chime at the end - listen for it). The log
+must say `stack descarregada em N passe(s)` and no `FALHOU`/`estagnou`.
+
+**What to expect on 7.3, and what to do if it goes wrong:**
+
+| Expectation / risk | Symptom if it goes wrong | What to do |
+|---|---|---|
+| The **codec package is still required**: stock 7.3 has the resume fixes but no `Channel Playback`, and leaves amp2 on cluster 0x01 (Left) | right speaker silent, even on a cold boot; `check-audio` FAIL on "patched module" / "stereo channel" | `.gate` shows why the build failed. If the API moved again, add a header probe to `module/Makefile` like `HAVE_SDCA_PARSE_FUNCTION_NO_SDW` (never a `LINUX_VERSION_CODE` check - distro kernels backport), then `sudo dkms install --force snd-soc-tas2783-sdw-px13/1.1 -k <kernel>` after copying `module/` to `/usr/src/snd-soc-tas2783-sdw-px13-1.1/`, and reboot. Upstream's module 1.2 (rebased on the 7.3 driver) is the fallback source if ours cannot be made to build |
+| The channel is re-applied after every re-init: upstream measured amp2 coming back on Left after s2idle on 7.3 | stereo on boot, mono after a suspend | the `PX13:` re-apply in `tas2783-sdw.c` covers it - if it stops working, check that `Channel Playback` still exists (`amixer -c1 controls`) and that the re-apply runs after the init sequence |
+| The **`sdw_utils` package is skipped** (its `BUILD_EXCLUSIVE_KERNEL` only matches Arch 7.2.x); 7.3's in-tree module has the fix | DKMS prints an exclusion notice (exit 77) - that is expected, not an error | nothing. `check-audio` confirms the in-tree fix from the binary |
+| **rt721 jack codec dies in runtime suspend** - seen upstream on 7.3.0-rc2, *not* on omarchy 7.2.5 | **no speaker sink at all**, the card only offers `off` / `pro-audio`; `-61` from rt721 in `journalctl -k`; `check-audio` FAIL "jack codec (rt721) alive" | install `configs/90-px13-rt721-no-autosuspend.rules` (steps inside the file), then a forced reload: `sudo PX13_RECOVER_POLICY=always /usr/local/lib/px13-soundwire-recover.sh` |
+| The fallback's unload passes do not depend on module names (a 7.3 platform module like `snd_sof_amd_acp7x` is picked up) | `rmmod estagnou` in the resume log, codecs never re-probed | read the modules it lists; extend `is_stack_module()` in `px13-soundwire-recover.sh` only if a stack module has a new name pattern, then reinstall it to `/usr/local/lib/` |
+| `SDW1-PIN4-CAPTURE-SmartAmp ... -22` (about 20 per boot and per reload) | log noise only - seen on 7.2.3 and 7.2.5 with working audio | ignore; not matched by the recovery's error filter |
+
+**After the Arch 7.2.3 kernel is uninstalled**, the `sdw_utils` package has
+nothing left to build for: `sudo dkms remove snd-soc-sdw-utils-px13/7.2.3 --all`
+and `sudo rm -rf /usr/src/snd-soc-sdw-utils-px13-7.2.3` (and the stale
+`-7.1.9` tree). If an Arch 7.2.y is still wanted, keep it - the package
+rebuilds there on its own.
+
 ---
 
 ## Suspend/resume (s2idle) recovery
@@ -350,6 +401,7 @@ untainted → worth filing. Does not → the bug is in this repo's patch.
 | `configs/ucm-card-override.conf.in` | `/usr/share/alsa/ucm2/conf.d/<CardDriver>/<CardLongName>.conf` — **both probed**, template placeholders substituted at install time | Forces the speaker codec; **unowned by any package** → survives `alsa-ucm-conf` updates |
 | `lib/px13-detect.sh` | `/usr/local/lib/px13-audio-detect.sh` | Runtime probes: card, driver, long name, amp count, ACP PCI, PipeWire names |
 | `check-audio.sh` | — | Post-update health check; non-zero exit if any invariant broke |
+| `configs/90-px13-rt721-no-autosuspend.rules` | `/etc/udev/rules.d/` — **only by hand**, when needed | Keeps the rt721 jack codec out of runtime suspend (upstream 7.3.0-rc2 failure; not needed on omarchy 7.2.5) |
 | `.gate` | — | Pre-reboot check: module and `sdw_utils` build on every installed kernel, scripts parse |
 | `configs/sof-soundwire_tas2783.conf` | `/usr/share/alsa/ucm2/sof-soundwire/tas2783.conf` | Speaker device for the HiFi profile; sets `tas2783-1 = Left`, `tas2783-2 = Right` on every profile activation (guarded on the **second** amp existing, so a single-amp variant still gets a mono Speaker instead of a broken profile) |
 | `configs/codecs_tas2783_init.conf` | `/usr/share/alsa/ucm2/codecs/tas2783/init.conf` | Volume-control remap (supports both driver generations) |
@@ -415,7 +467,8 @@ If the sides are physically swapped, exchange the two `cset` values in
 - **Mono / one speaker only, right after a kernel update** — the DKMS build
   failed and the stock module took over. `bash check-audio.sh` says so in one
   line; `dkms status` and
-  `/var/lib/dkms/snd-soc-tas2783-sdw-px13/1.0/build/make.log` say why. If the
+  `/var/lib/dkms/snd-soc-tas2783-sdw-px13/1.1/build/make.log` say why (`./.gate`
+  shows it for every installed kernel). If the
   driver API moved again, the module source needs a rebase (see
   [Kernel updates](#kernel-updates-what-breaks-and-how-to-tell)); otherwise
   `bash install-durable.sh` is enough. Without dkms: `cd module && make` then
@@ -426,6 +479,20 @@ If the sides are physically swapped, exchange the two `cset` values in
   volume, and a driver swap under it can bring it back at `0% / -inf dB`. The
   installer now raises a 0% speaker sink to 60%; `bash check-audio.sh` flags
   it.
+- **Right speaker silent on a distro kernel whose version looks old** (e.g.
+  `linux-omarchy` 7.2.5) — the distro backported a newer SDCA API; see the
+  [runbook](#runbook-for-the-next-kernel-update-written-for-73). Always probe
+  headers, never trust `LINUX_VERSION_CODE`.
+- **No speaker sink at all, card offers only `off` / `pro-audio`** — first
+  check the rt721 jack codec: `journalctl -k -b | grep 'rt721.*(-61)'`. If
+  it prints anything, install `configs/90-px13-rt721-no-autosuspend.rules`
+  and force a reload (see the runbook table).
+- **Failed DKMS build messages for `snd-soc-sdw-utils-px13` during a kernel
+  update** — expected to be an exclusion notice (exit 77) on kernels that do
+  not need it. A real build *error* there means `BUILD_EXCLUSIVE_KERNEL`
+  matched a kernel it should not have; regenerate `dkms.conf` with
+  `KVER=<the kernel it is for> module-sdw-utils/fetch-sources.sh` and copy it
+  to `/usr/src/snd-soc-sdw-utils-px13-<ver>/`.
 - **Sound goes to pro-audio profile / "Invalid argument"** — switch profile:
   `pactl set-card-profile "$(pactl list short cards | awk '/sdw/{print $2;exit}')" HiFi`.
 - **Dead after suspend** — `bash install-resume-recovery.sh`; recover

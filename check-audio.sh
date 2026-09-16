@@ -35,8 +35,29 @@ if command -v dkms >/dev/null 2>&1; then
   DK="$(dkms status snd-soc-tas2783-sdw-px13 2>/dev/null | grep -c "$(uname -r).*installed")"
   [ "${DK:-0}" -ge 1 ] && ok "DKMS built for this kernel" \
     || bad "DKMS built for this kernel" "dkms status shows no 'installed' line for $(uname -r).
-           Usually the driver API moved upstream; see /var/lib/dkms/snd-soc-tas2783-sdw-px13/1.0/build/make.log"
+           Usually the driver API moved upstream: run ./.gate, and see
+           /var/lib/dkms/snd-soc-tas2783-sdw-px13/$(sed -n 's/^PACKAGE_VERSION="\(.*\)"/\1/p' "$REPO/module/dkms.conf")/build/make.log"
 fi
+
+# 1a. the jack codec must not be stuck in runtime suspend ----------------------
+# PipeWire's ACP probes every mapping of the UCM HiFi verb and drops the whole
+# profile if one fails. On 7.3.0-rc2 (upstream cde590d) the rt721-sdca jack
+# codec runtime-suspends after probe and never resumes (-61, -ENODATA), which
+# removes the Speaker sink too while the amp checks still pass. Not seen on
+# linux-omarchy 7.2.5, where runtime PM stays 'auto' and resumes fine - so
+# only the failure itself is flagged, not the setting.
+for RT in /sys/bus/soundwire/devices/sdw:*:025d:0721:*; do
+  [ -e "$RT/power/runtime_status" ] || continue
+  RTS="$(cat "$RT/power/runtime_status")"; RTC="$(cat "$RT/power/control")"
+  if [ "$RTS" = suspended ] && journalctl -k -b --no-pager 2>/dev/null | grep -q 'rt721.*(-61)'; then
+    bad "jack codec (rt721) alive" "runtime-suspended and failing to resume (-61 in dmesg).
+           The HiFi profile gets rejected and the speaker sink with it.
+           Fix: install configs/90-px13-rt721-no-autosuspend.rules (steps in the
+           file), then: sudo PX13_RECOVER_POLICY=always /usr/local/lib/px13-soundwire-recover.sh"
+  else
+    ok "jack codec (rt721) alive (runtime $RTS, control $RTC, no -61 resume errors)"
+  fi
+done
 
 # 1b. the sdw_utils module with the RESUME re-prepare fix ---------------------
 SDWU="$(modinfo -k "$(uname -r)" snd_soc_sdw_utils -F filename 2>/dev/null)"
