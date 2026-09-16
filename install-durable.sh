@@ -250,6 +250,24 @@ if SPK="$(px13_pw_speaker_sink_as asuser)"; then
   fi
 fi
 
+# The ACP DMIC on this chassis is quiet and has no capture gain control:
+# speech lands around -38 dBFS at 100%, which most apps and voice-activity
+# detectors treat as silence - it reads as "the mic is dead". +13.8 dB (170%
+# on PipeWire's cubic scale) puts speech near -28 dBFS with the measured peaks
+# still 3 dB under full scale; WirePlumber persists it. Only a volume at or
+# below the 100% default is raised, never one the user chose. Ported from
+# upstream ftoleedo/px13-audio-fix fd5cfaa (measured there 2026-09-13).
+if [ "$SESSION_OK" = 1 ]; then
+  MIC="$(asuser pactl list short sources 2>/dev/null | awk '/amd_sdw.*Mic__source/ {print $2; exit}')" || MIC=""
+  if [ -n "${MIC:-}" ]; then
+    MV="$(asuser pactl get-source-volume "$MIC" 2>/dev/null | sed -n 's/.*\/ *\([0-9]\+\)%.*/\1/p' | head -1)" || MV=""
+    if [ -n "${MV:-}" ] && [ "$MV" -le 100 ] 2>/dev/null; then
+      asuser pactl set-source-volume "$MIC" 170% 2>/dev/null || true
+      echo "    internal mic (DMIC) is quiet on this chassis -> source raised to 170% (+13.8 dB)"
+    fi
+  fi
+fi
+
 echo "==> 7/8 Persisting the ALSA state"
 root_run alsactl store || true
 
