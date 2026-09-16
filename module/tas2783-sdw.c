@@ -1724,12 +1724,13 @@ static s32 tas_sdw_probe(struct sdw_slave *peripheral,
 		 *
 		 *   (dev, sdw, desc, function)  - e.g. Arch 7.1.9-arch1-2
 		 *   (dev, sdw, function)        - the form this driver was written against
-		 *   (dev, function)             - 7.3, peripheral reached via function->desc
+		 *   (dev, function)             - 7.3 (and linux-omarchy 7.2.5),
+		 *                                 peripheral reached via function->desc
 		 */
 #if defined(HAVE_SDCA_PARSE_FUNCTION_DESC)
 		ret = sdca_parse_function(dev, peripheral, function_data->desc,
 					  function_data);
-#elif LINUX_VERSION_CODE >= KERNEL_VERSION(7, 3, 0)
+#elif defined(HAVE_SDCA_PARSE_FUNCTION_NO_SDW)
 		ret = sdca_parse_function(dev, function_data);
 #else
 		ret = sdca_parse_function(dev, peripheral, function_data);

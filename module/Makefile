@@ -16,6 +16,10 @@ KHDR := $(if $(srctree),$(srctree),$(KDIR))
 ccflags-y += $(shell awk '/^int sdca_parse_function/,/;/' \
 	$(KHDR)/include/sound/sdca_function.h 2>/dev/null \
 	| grep -q sdca_function_desc && echo -DHAVE_SDCA_PARSE_FUNCTION_DESC)
+# (dev, function) form: 7.3, and backported into linux-omarchy 7.2.5
+ccflags-y += $(shell awk '/^int sdca_parse_function/,/;/' \
+	$(KHDR)/include/sound/sdca_function.h 2>/dev/null \
+	| grep -q sdw_slave || echo -DHAVE_SDCA_PARSE_FUNCTION_NO_SDW)
 ccflags-y += $(shell grep -q sdw_slave_wait_for_init \
 	$(KHDR)/include/linux/soundwire/sdw.h 2>/dev/null \
 	&& echo -DHAVE_SDW_SLAVE_WAIT_FOR_INIT)
